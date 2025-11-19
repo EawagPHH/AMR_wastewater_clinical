@@ -1,0 +1,3156 @@
+---
+title: "Monitoring of clinically relevant antibiotic resistant bacteria in Swiss wastewater"
+author: "Sheena Conforti, Melissa Pitton and Patrick Schmidhalter"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+# suppress warnings and messages to create neat final output
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+# Description
+
+This notebook describes and contains all analyses and plots for the study about the monitoring of clinically relevant antibiotic resistant bacteria (ARB) in Swiss wastewater. Three main datasets are present: wastewater (Eawag), clinical data (ANRESIS), and antibiotic consumption data (IQVIA Switzerland).
+
+# Code preparation
+
+## Load libraries
+
+```{r install-packages, eval=TRUE, message=FALSE, warning=FALSE}
+#install.packages("urca")
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+library(stringr)
+library(ggplot2)
+library(ggfortify)
+library(ggpubr)
+library(plotly)
+library(broom)
+library(lmerTest)
+library(emmeans)
+library(rstatix)
+library(tidyverse)
+library(scales)
+library(trend)
+library(purrr)
+library(plotly)
+library(FSA)
+library(lubridate)
+library(knitr)
+library(kableExtra)
+library(patchwork)
+library(sf)
+library(viridis)
+library(RColorBrewer)
+library(ggpattern)
+library(ggrepel)
+library(cowplot)
+library(tsibble)
+library(fable)
+library(fabletools)
+library(feasts)
+library(urca)
+library(trend)
+library(janitor)
+```
+
+## Define functions
+
+```{r define-functions, eval=TRUE, message=FALSE, warning=FALSE}
+# Summary statistics for clinical data
+compute_summary_statistics <- function(data, column) {
+  data %>%
+    group_by(target, resistance) %>%
+    summarise(
+      mean = round(mean(get(column), na.rm = TRUE), 1),
+      sd = round(sd(get(column), na.rm = TRUE), 1),
+      median = round(median(get(column), na.rm = TRUE), 1),
+      iqr = round(IQR(get(column), na.rm = TRUE), 1),
+      max = round(max(get(column), na.rm = TRUE), 1),
+      min = round(min(get(column), na.rm = TRUE), 1),
+      cv = round((sd / mean) * 100, 1),  # Coefficient of variation
+      count = n()
+    )
+}
+
+# Summary statistics for wastewater data
+compute_summary_statistics_ww <- function(data, column) {
+  data %>%
+    group_by(resistance) %>%
+    summarise(
+      mean = round(mean(get(column), na.rm = TRUE), 1),
+      sd = round(sd(get(column), na.rm = TRUE), 1),
+      median = round(median(get(column), na.rm = TRUE), 1),
+      iqr = round(IQR(get(column), na.rm = TRUE), 1),
+      max = round(max(get(column), na.rm = TRUE), 1),
+      min = round(min(get(column), na.rm = TRUE), 1),
+      cv = round((sd / mean) * 100, 1),  # Coefficient of variation
+      count = n()
+    )
+}
+
+# Compute Pearson and Spearman correlation coefficients
+compute_correlations <- function(data) {
+  pearson <- cor.test(data$Resistance_Clinical, data$Resistance_Wastewater, method = "pearson")
+  spearman <- cor.test(data$Resistance_Clinical, data$Resistance_Wastewater, method = "spearman")
+  
+  tibble(
+    Pearson_Correlation = pearson$estimate,
+    Pearson_p_value = pearson$p.value,
+    Spearman_Correlation = spearman$estimate,
+    Spearman_p_value = spearman$p.value
+  )
+}
+```
+
+## Define other dataframes
+
+```{r additional-df, eval=TRUE, message=FALSE, warning=FALSE}
+# Population data (i.e., individuals living in the catchments)
+population_data <- data.frame(
+  ara = c("Lugano", "Chur", "Geneva", "Laupen", "Zurich", "Altenrhein"),
+  population = c(124000, 55000, 454000, 62000, 471000, 64000)
+)
+
+# Create canton-level population dataframe manually (translated)
+population_cantons <- tibble::tribble(
+  ~canton, ~Population,
+  "Vaud", 847502,
+  "Valais", 367263,
+  "Geneva", 526171,
+  "Berne", 1066177,
+  "Fribourg", 342447,
+  "Solothurn", 287463,
+  "Neuchâtel", 178593,
+  "Jura", 74555,
+  "Basel-City", 200638,
+  "Basel-Country", 299319,
+  "Aargau", 728493,
+  "Zurich", 1608245,
+  "Glarus", 42151,
+  "Schaffhausen", 87554,
+  "Appenzell Outer Rhodes", 56524,
+  "Appenzell Inner-Rhodes", 16544,
+  "St. Gall", 536041,
+  "Grisons", 205087,
+  "Thurgau", 296394,
+  "Lucerne", 434373,
+  "Uri", 37971,
+  "Schwyz", 167513,
+  "Obwalden", 39345,
+  "Nidwalden", 44962,
+  "Zug", 132443,
+  "Ticino", 357797
+)
+```
+
+# Data preparation
+
+Import different dataframes and perform initial formatting.
+
+```{r data-load-format, warning=FALSE, message=FALSE, eval=TRUE}
+# Import dataframes with raw data
+df_ww_raw <- read_excel("data/wastewater_data.xlsx") #CFUs/100mL
+df_cl_raw <- read_excel("data/anresis_data.xlsx")
+df_ab_raw <-read_excel("data/antibiotics_data.xlsx")
+
+#Filter for ESBL-E.coli, CR-E.coli and VRE
+df_cl_raw_filtered <- df_cl_raw %>%
+  filter(!grepl("Staphylococcus aureus", mo_name))
+
+# Initial formatting
+## Wastewater
+df_ww <- df_ww_raw %>%
+  dplyr::rename(
+    ara =  Place
+  )
+
+df_ww <- df_ww %>%
+  mutate(date = as.Date(date, format = "%d_%m_%Y"))
+
+# Convert all numerical columns (except date and ara) to numeric
+df_ww[, 3:ncol(df_ww)] <- lapply(df_ww[, 3:ncol(df_ww)], as.numeric)
+
+## Clinical
+df_cl <- df_cl_raw_filtered %>%
+  dplyr::rename(
+    target =  mo_name,
+    resistance = `Resistance-type`,
+    date = day_day,
+    year = year_yr_of_year,
+    canton = canton_name
+  )
+
+df_cl <- df_cl %>% 
+  mutate(date = as.Date(date, format = "%Y-%m-%dT%H:%M"))
+```
+
+# Wastewater data
+
+## Data modification
+
+Modify the wastewater dataframe to contain numerical mean values for CFU concentrations, week, and population data (defined at the start of the script).
+
+```{r ww-data-modification, eval=TRUE, message=FALSE, warning=FALSE}
+df_ww_avg <- df_ww %>%
+  mutate(
+    ecoli_mean = rowMeans(select(., ecoli_1, ecoli_2), na.rm = TRUE),
+    esbl_mean = rowMeans(select(., esbl_1, esbl_2), na.rm = TRUE),
+    cre_mean = rowMeans(select(., cre_1, cre_2), na.rm = TRUE),
+    enterococcus_mean = rowMeans(select(., enterococcus_1, enterococcus_2), na.rm = TRUE),
+    vre_mean = rowMeans(select(., vre_1, vre_2), na.rm = TRUE)
+  ) %>%
+  select(date, ara, ecoli_mean, esbl_mean, cre_mean, enterococcus_mean, vre_mean, flow_rate_m_3_day)  # Keep only relevant columns
+
+# Ensure numeric columns
+df_ww_avg <- df_ww_avg %>%
+  mutate(across(c(ecoli_mean, esbl_mean, cre_mean, enterococcus_mean, vre_mean), as.numeric))
+
+# Add week column
+df_ww_avg <- df_ww_avg %>%
+  mutate(week = floor_date(date, unit = "week", week_start = 1)) 
+
+# Join population data
+df_ww_avg <- df_ww_avg %>%
+  left_join(population_data, by = "ara")
+```
+
+## Detection of ARB in wastewater
+
+The following table summarizes the detection of antimicrobial-resistant bacteria (ARB) in Swiss wastewater samples. For each bacterial target, the table reports the number of samples that were tested (i.e., where at least one technical replicate was plated), how many were tested using both technical replicates, and how many were tested with only one replicate. It also includes the percentage of samples with both replicates, as well as the number and percentage of samples testing positive for each target.
+
+```{r tableS2, message=FALSE, warning=FALSE, eval=TRUE}
+# Define targets and labels
+targets <- c("ecoli", "esbl", "cre", "enterococcus", "vre")
+
+target_labels <- c(
+  ecoli = "<i>E. coli</i>",
+  esbl = "ESBL-<i>E. coli</i>",
+  cre = "CR-<i>E. coli</i>",
+  enterococcus = "<i>Enterococcus</i> spp.",
+  vre = "VRE"
+)
+
+# Pivot longer and clean up
+df_long <- df_ww %>%
+  pivot_longer(cols = -c(date, ara), names_to = "target_rep", values_to = "count") %>%
+  separate(target_rep, into = c("target", "replicate"), sep = "_") %>%
+  mutate(count = as.numeric(count))
+
+# Total number of unique wastewater samples received
+total_samples_received <- df_ww %>%
+  distinct(date, ara) %>%
+  nrow()
+
+# Summarize: only include samples where at least one replicate is not NA
+tableS2 <- df_long %>%
+  group_by(date, ara, target) %>%
+  summarise(
+    n_reps = sum(!is.na(count)),
+    positive = any(count > 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n_reps > 0) %>%  # Only keep samples that were actually tested
+  group_by(target) %>%
+  summarise(
+    samples_tested = n(),
+    both_replicates = sum(n_reps == 2),
+    one_replicate = sum(n_reps == 1),
+    both_replicates_percent = round(100 * both_replicates / n(), 1),
+    samples_positive = sum(positive),
+    percent_positive = round(100 * samples_positive / n(), 1),
+    .groups = "drop"
+  ) %>%
+  mutate(`Bacterial Target` = recode(target, !!!target_labels)) %>%
+  select(
+    `Bacterial Target`,
+    `Samples Tested (n)` = samples_tested,
+    `Samples with Both Replicates (n)` = both_replicates,
+    `Samples with One Replicate (n)` = one_replicate,
+    `Samples with Both Replicates (%)` = both_replicates_percent,
+    `Samples Positive (n)` = samples_positive,
+    `Samples Positive (%)` = percent_positive
+  )
+
+# Set the desired order before converting to character
+target_order <- c(
+  "<i>E. coli</i>",
+  "ESBL-<i>E. coli</i>",
+  "CR-<i>E. coli</i>",
+  "<i>Enterococcus</i> spp.",
+  "VRE"
+)
+
+# Convert all columns to character first
+tableS2 <- tableS2 %>%
+  mutate(`Bacterial Target` = factor(`Bacterial Target`, levels = target_order)) %>%
+  arrange(`Bacterial Target`) %>%
+  mutate(across(everything(), as.character))
+
+# Add the summary row (with "-" where applicable)
+tableS2 <- bind_rows(
+  tableS2,
+  tibble(
+    `Bacterial Target` = "<b>Total wastewater samples received</b>",
+    `Samples Tested (n)` = as.character(total_samples_received),
+    `Samples with Both Replicates (n)` = "-",
+    `Samples with One Replicate (n)` = "-",
+    `Samples with Both Replicates (%)` = "-",
+    `Samples Positive (n)` = "-",
+    `Samples Positive (%)` = "-"
+  )
+)
+# Display table
+tableS2 %>%
+  kable(
+    format = "html",
+    escape = FALSE,
+    caption = "Table S2: Summary of antimicrobial-resistant bacteria (ARB) detection in Swiss wastewater samples. The table reports, for each bacterial target, the number of tested samples (i.e., with at least one replicate plated), the number and percentage with both technical replicates, the number with only one replicate, and the number and percentage of samples testing positive for the target. The last row shows the total number of wastewater samples received during the study.",
+    longtable = TRUE,
+    booktabs = TRUE
+  ) %>%
+  kable_styling(
+    full_width = FALSE,
+    position = "center",
+    latex_options = c("hold_position", "repeat_header"),
+    font_size = 12
+  )
+
+
+# Optional: Save to CSV
+#write.csv(tableS2, "./tables/tableS2.csv", row.names = FALSE)
+```
+
+## Missing measurements
+
+Refined Summary of Missing ARB Measurements\
+This chunk lists missing ARB measurements only for dates where plating was expected. For each target, we restrict the analysis to the actual screening period:
+
+-   CR-*E. coli*: from 2022-11-15 onward
+
+-   Enterococcus spp. and VRE: from 2022-11-29
+
+The output groups missing data by location and target, and lists all missing dates (with both replicates NA) in a compact, readable format.
+
+```{r tableS3, message=FALSE, warning=FALSE, eval=TRUE}
+# Define readable target labels
+target_labels <- c(
+  ecoli = "<i>E. coli</i>",
+  esbl = "ESBL-<i>E. coli</i>",
+  cre = "CR-<i>E. coli</i>",
+  enterococcus = "<i>Enterococcus</i> spp.",
+  vre = "VRE"
+)
+
+# Define screening start and end per target
+screening_start <- c(
+  ecoli = as.Date("1900-01-01"),
+  esbl = as.Date("1900-01-01"),
+  cre = as.Date("2022-11-15"),
+  enterococcus = as.Date("2022-11-29"),
+  vre = as.Date("2022-11-29")
+)
+
+screening_end <- c(
+  ecoli = as.Date("2100-01-01"),
+  esbl = as.Date("2100-01-01"),
+  cre = as.Date("2100-01-01"),
+  enterococcus = as.Date("2100-01-01"),
+  vre = as.Date("2100-01-01")
+)
+
+# Process data
+tableS3 <- df_ww %>%
+  pivot_longer(cols = -c(date, ara), names_to = "target_rep", values_to = "count") %>%
+  separate(target_rep, into = c("target", "replicate"), sep = "_") %>%
+  mutate(count = as.numeric(count)) %>%
+  group_by(date, ara, target) %>%
+  summarise(both_missing = all(is.na(count)), .groups = "drop") %>%
+  filter(both_missing) %>%
+  filter(
+    date >= screening_start[target] & date <= screening_end[target]
+  ) %>%
+  mutate(`Bacterial Target` = recode(target, !!!target_labels)) %>%
+  group_by(Location = ara, `Bacterial Target`) %>%
+  summarise(`Missing Dates` = paste(sort(unique(as.character(date))), collapse = ", "), .groups = "drop") %>%
+  arrange(Location, `Bacterial Target`)
+
+# Display table
+tableS3 %>%
+  kable(
+    format = "html",
+    escape = FALSE,
+    caption = "Table S3: Summary of missing ARB measurements in Swiss wastewater samples. Only dates within the defined screening period for each bacterial target were considered. Missing values are shown per location and target as comma-separated dates where both replicates were absent.",
+    longtable = TRUE,
+    booktabs = TRUE
+  ) %>%
+  kable_styling(
+    full_width = FALSE,
+    position = "center",
+    latex_options = c("hold_position", "repeat_header"),
+    font_size = 12
+  )
+
+# Optional: Save table
+#write.csv(tableS3, "./tables/tableS3.csv", row.names = FALSE)
+```
+
+## Wastewater resistance
+
+ARB percentages are first computed for each entry, then they are aggregated by week and at a national level using a population-weighted mean. Further, a new dataframe is created with pivoted data for better analysis and plotting.
+
+```{r arb-ww-aggregation, eval=TRUE, message=FALSE, warning=FALSE}
+# For each entry
+ww_percentages <- df_ww_avg %>%
+  mutate(
+    esbl_percentage = ifelse(!is.na(ecoli_mean) & ecoli_mean != 0, (esbl_mean / ecoli_mean) * 100, NA),
+    cre_percentage = ifelse(!is.na(ecoli_mean) & ecoli_mean != 0, (cre_mean / ecoli_mean) * 100, NA),
+    vre_percentage = ifelse(!is.na(enterococcus_mean) & enterococcus_mean != 0, (vre_mean / enterococcus_mean) * 100, NA)
+  )
+
+# Population-weighted
+weighted_percentages <- ww_percentages %>%
+  group_by(week) %>%
+  summarise(
+    esbl_weighted_percentage = ifelse(
+      all(is.na(esbl_percentage)), NA,
+      sum(esbl_percentage * population, na.rm = TRUE) / sum(population[!is.na(esbl_percentage)], na.rm = TRUE)
+    ),
+    cre_weighted_percentage = ifelse(
+      all(is.na(cre_percentage)), NA,
+      sum(cre_percentage * population, na.rm = TRUE) / sum(population[!is.na(cre_percentage)], na.rm = TRUE)
+    ),
+    vre_weighted_percentage = ifelse(
+      all(is.na(vre_percentage)), NA,
+      sum(vre_percentage * population, na.rm = TRUE) / sum(population[!is.na(vre_percentage)], na.rm = TRUE)
+    )
+  )
+
+# Pivot the weighted percentages data for plotting
+weighted_percentages_long <- weighted_percentages %>%
+  pivot_longer(
+    cols = c("esbl_weighted_percentage", "cre_weighted_percentage", "vre_weighted_percentage"),
+    names_to = "resistance",
+    values_to = "percentage"
+  ) %>%
+  mutate(
+    resistance = case_when(
+      resistance == "esbl_weighted_percentage" ~ "ESBL-E. coli",
+      resistance == "cre_weighted_percentage" ~ "CR-E. coli",
+      resistance == "vre_weighted_percentage" ~ "VRE",
+      TRUE ~ resistance
+    )
+  )
+
+# Remove NA values
+weighted_percentages_long <- weighted_percentages_long %>%
+  filter(!is.na(percentage))
+
+# Ensure `week` is a Date
+weighted_percentages_long <- weighted_percentages_long %>%
+  mutate(week = as.Date(week))
+```
+
+### National percentages of ARB in wastewater: summary statistic
+
+For each ARB, at national level.
+
+```{r arb_percentage_summary_ww, message=FALSE, warning=FALSE, eval=TRUE}
+# Compute summary statistics per resistance group
+table1a <- weighted_percentages_long %>%
+  group_by(resistance) %>%
+  summarise(
+    `Mean ± SD (%)` = sprintf("%.1f ± %.1f", mean(percentage, na.rm = TRUE), sd(percentage, na.rm = TRUE)),
+    `Median (IQR) %` = {
+      med <- median(percentage, na.rm = TRUE)
+      iqr_val <- IQR(percentage, na.rm = TRUE)
+      sprintf("%.1f (%.1f)", med, iqr_val)
+    },
+    `Min (%)` = sprintf("%.1f", min(percentage, na.rm = TRUE)),
+    `Max (%)` = sprintf("%.1f", max(percentage, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  rename(`Bacterial Target` = resistance)
+
+# Display as a table
+table1a %>%
+  kable(
+    format = "html",
+    escape = FALSE,
+    caption = "Table 1a: Summary statistics of weekly population-weighted resistance percentages in wastewater for each antimicrobial-resistant bacterium (ARB). Values include the mean ± standard deviation (SD), median with interquartile range (IQR), and range (minimum–maximum) across the national study period. ARBs include extended-spectrum β-lactamase-producing Escherichia coli (ESBL-E. coli), carbapenem-resistant E. coli (CR-E. coli) and vancomycin-resistant Enterococcus faecium/fecalis (VRE).",
+    booktabs = TRUE
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    full_width = FALSE,
+    font_size = 12,
+    position = "center"
+  )
+```
+
+### National trend analysis
+
+Analysis of trends using the Mann-Kendall Trend Test (<https://www.nataliechazal.info/post/mk_rtrend/>) and the Sen's slope test (<https://search.r-project.org/CRAN/refmans/trend/html/sens.slope.html>). Assumption: no seasonality is present. Tau value can range from -1 to 1.
+
+```{r sens-slope-ww, eval=TRUE, message=FALSE, warning=FALSE}
+# Mann–Kendall test per resistance
+mk_results <- weighted_percentages_long %>%
+  arrange(resistance, week) %>%
+  group_by(resistance) %>%
+  summarise(
+    mk_test = list(mk.test(percentage)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    tau     = round(map_dbl(mk_test, ~ .x$estimates["tau"]), 2),
+    p_value = signif(map_dbl(mk_test, ~ .x$p.value), 3)
+  ) %>%
+  select(resistance, tau, p_value)
+
+#Convert week to a date and numeric to compute Sen's slope test
+weighted_percentages_long_sens <- weighted_percentages_long %>%
+  mutate(
+    week = as.Date(week),
+    time_num = as.numeric(week)   
+  )
+
+#Compute Sen's slope test by resistance type
+sens_results <- weighted_percentages_long_sens %>%
+  arrange(week) %>%      
+  group_by(resistance) %>%
+  do({
+    model <- sens.slope(.$percentage)
+    tibble(
+      sen_slope = model$estimates,
+      conf_low  = model$conf.int[1],
+      conf_high = model$conf.int[2],
+      p_value   = model$p.value
+    )
+  })
+
+#Multiply slope per year
+sens_results_year <- sens_results %>%
+  mutate(
+    slope_per_year     = sen_slope * 52,
+    conf_low_per_year  = conf_low * 52,
+    conf_high_per_year = conf_high * 52
+  )
+
+#Combine table MK and Sen's slope
+tableS4a_combined <- mk_results %>%
+  left_join(
+    sens_results_year %>%
+      select(resistance, slope_per_year, conf_low_per_year, conf_high_per_year),
+    by = "resistance"
+  ) %>%
+  mutate(
+    # numeric formatting (adjust digits as you like)
+    slope_per_year    = round(slope_per_year, 3),
+    ci_halfwidth_year = round((conf_high_per_year - conf_low_per_year) / 2, 3),
+    sen_slope_ci      = paste0(slope_per_year, " \u00B1 ", ci_halfwidth_year)
+  ) %>%
+  select(
+    `Bacterial Target` = resistance,
+    `Tau (𝜏)`          = tau,
+    `p-value`          = p_value,
+    `Sen's slope (% points per year) ± 95% CI` = sen_slope_ci
+  )
+
+#Display combined table
+tableS4a_combined %>%
+  kable(
+    format  = "html",
+    escape  = FALSE,
+    caption = "Table S4a: Mann–Kendall trend test and Sen's slope estimates for national wastewater resistance percentages by bacterial target. The tau coefficient (𝜏) reflects the strength and direction of monotonic trends over time. Sen's slope values represent the estimated annual change in percentage points with 95% confidence intervals.",
+    booktabs  = TRUE,
+    longtable = FALSE
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    full_width    = FALSE,
+    position      = "center",
+    font_size     = 12
+  )
+```
+
+#### Decomposition for trend
+
+```{r mann-kendall-decomposed, eval=TUE, message=FALSE, warning=FALSE}
+# Function to create a combined plot with faceting for decomposition components
+plot_decomp_facet <- function(ts_decomp, title) {
+  seasonality <- ts_decomp$seasonal
+  trend <- ts_decomp$trend
+  random <- ts_decomp$random
+  observed <- ts_decomp$x
+  
+  df <- data.frame(
+    Week = seq_along(observed),
+    Component = rep(c("Observed", "Trend", "Seasonal", "Random"), each = length(observed)),
+    Value = c(as.numeric(observed), as.numeric(trend), as.numeric(seasonality), as.numeric(random))
+  )
+  
+  p <- ggplot(df, aes(x = Week, y = Value)) +
+    geom_line() +
+    facet_wrap(~ Component,
+               scales = "free_y",
+               ncol = 1,
+               strip.position = "right") +
+    ggtitle(title) +
+    theme_bw() +
+    theme(
+      strip.text.y = element_text(angle = 90, vjust = 0.5),
+      strip.background = element_rect(fill = "white"),
+      axis.text = element_text(color = "black")  # Set all axis texts to black
+    )
+  
+  return(p)
+}
+
+# Decompose time series and plot only the decomposition for each resistance group
+decomposition_results <- list()
+decomp_plots <- list()
+
+resistance_groups <- unique(weighted_percentages_long$resistance)
+
+for (resistance_group in resistance_groups) {
+  # Subset data
+  data_subset <- weighted_percentages_long %>%
+    filter(resistance == resistance_group) %>%
+    arrange(week)
+  
+  # Convert to time series object
+  ts_data <- ts(data_subset$percentage, frequency = 52)  # assuming weekly data
+  
+  # Decompose time series
+  decomposition <- decompose(ts_data)
+  decomposition_results[[resistance_group]] <- decomposition
+  
+  # Custom decomposition plot
+  decomp_plot <- plot_decomp_facet(decomposition, paste("Decomposition of", resistance_group))
+  decomp_plots[[resistance_group]] <- decomp_plot
+}
+
+# Combine separate decomposition plot for each resistance group
+figS1 <- wrap_plots(decomp_plots, ncol = 2)  # Use ncol = 2 for two columns
+
+figS1
+
+#Optional save
+#ggsave("./figures/FigureS1.pdf", figS1, width = 11.69, height = 8.27 , units = "in")
+```
+
+### Differences between WWTPs
+
+#### Statistical analyses
+
+Kruskal-Wallis and Dunn's multiple comparison test.
+
+```{r tableS5, message=FALSE, warning=FALSE, eval=TRUE}
+# Reshape the data
+ww_percentages_long <- ww_percentages %>%
+  pivot_longer(cols = ends_with("_percentage"), names_to = "variable", values_to = "value") %>%
+  mutate(variable = gsub("_percentage", "", variable))
+
+# Define readable labels
+target_labels <- c(
+  ecoli = "E. coli",
+  esbl = "ESBL-E. coli",
+  cre = "CR-E. coli",
+  enterococcus = "Enterococcus spp.",
+  vre = "VRE"
+)
+
+# Kruskal-Wallis test
+kruskal_results <- ww_percentages_long %>%
+  group_by(variable) %>%
+  summarise(
+    `Kruskal-Wallis p-value` = signif(kruskal.test(value ~ ara)$p.value, 3),
+    `Significant (p < 0.05)` = ifelse(`Kruskal-Wallis p-value` < 0.05, "Yes", "No"),
+    .groups = "drop"
+  )
+
+# Apply labels to Kruskal-Wallis table
+kruskal_results <- kruskal_results %>%
+  mutate(
+    `Bacterial Target` = recode(variable, !!!target_labels)
+  ) %>%
+  select(`Bacterial Target`, `Kruskal-Wallis p-value`, `Significant (p < 0.05)`)
+
+# Display summary table
+kruskal_results %>%
+  kable(
+    format = "html",
+    caption = "Kruskal-Wallis test results for differences in ARB percentages across WWTPs. Significance was determined at the 0.05 level.",
+    booktabs = TRUE
+  ) %>%
+  kable_styling(
+    full_width = FALSE,
+    font_size = 12,
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+
+# Dunn’s post hoc test
+dunn_results <- ww_percentages_long %>%
+  group_by(variable) %>%
+  summarise(posthoc = list(dunnTest(value ~ ara, method = "bonferroni")$res)) %>%
+  unnest(posthoc) %>%
+  mutate(
+    `Significant (p < 0.05)` = ifelse(P.adj < 0.05, "Yes", "No"),
+    Direction = ifelse(Z > 0, "Higher", "Lower")
+  )
+
+# Apply labels to Dunn results
+dunn_results <- dunn_results %>%
+  mutate(
+    `Bacterial Target` = recode(variable, !!!target_labels)
+  ) %>%
+  rename(
+    `WWTP Comparison` = Comparison,
+    `Z-value` = Z,
+    `Adjusted p-value` = P.adj
+  ) %>%
+  select(`Bacterial Target`, `WWTP Comparison`, `Z-value`, `Adjusted p-value`, Direction, `Significant (p < 0.05)`)
+
+# Display Dunn’s test results with clean formatting
+dunn_results %>%
+  select(`Bacterial Target`, `WWTP Comparison`, `Z-value`, `Adjusted p-value`, Direction, `Significant (p < 0.05)`) %>%
+  kable(
+    format = "html",
+    caption = "Table S5: Dunn’s multiple comparison test results for ARB percentages across WWTPs. Comparisons were adjusted using the Bonferroni method. Direction indicates whether the first WWTP in the comparison had higher or lower values.",
+    booktabs = TRUE,
+    longtable = TRUE
+  ) %>%
+  kable_styling(
+    full_width = FALSE,
+    font_size = 11,
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+
+# Save full Dunn’s results
+#write.csv(dunn_results, "./tables/tableS5.csv", row.names = FALSE)
+```
+
+#### Location trend analyses
+
+```{r tableS6, message=FALSE, warning=FALSE, eval=TRUE}
+# Define labels for readability
+target_labels <- c(
+  esbl = "ESBL-E.coli",
+  cre = "CR-E.coli",
+  vre = "VRE"
+)
+
+# Filter, group, test, and combine in one pipeline
+tableS6 <- ww_percentages_long %>%
+  filter(variable %in% names(target_labels)) %>%
+  drop_na(value) %>%
+  arrange(ara, variable, week) %>%
+  group_by(ara, variable) %>%
+  summarise(
+    mk_test = list(mk.test(value)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    tau = round(map_dbl(mk_test, ~ .x$estimates["tau"]), 2),
+    p_value = signif(map_dbl(mk_test, ~ .x$p.value), 3),
+    `Significant (p < 0.05)` = ifelse(p_value < 0.05, "Yes", "No"),
+    `Bacterial Target` = recode(variable, !!!target_labels)
+  ) %>%
+  select(`WWTP` = ara, `Bacterial Target`, tau, `p_value`, `Significant (p < 0.05)`)
+
+# Display table
+tableS6 %>%
+  kable(
+    format = "html",
+    escape = FALSE,
+    caption = "Table S6: Mann-Kendall trend test results for ARB percentage trends at each WWTP. Tau values indicate the direction and strength of monotonic trends. Significance assessed at p < 0.05.",
+    booktabs = TRUE,
+    longtable = TRUE
+  ) %>%
+  kable_styling(
+    full_width = FALSE,
+    font_size = 12,
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+
+# Optionally save
+#write.csv(tableS6, "./tables/tableS6.csv", row.names = FALSE)
+```
+
+# Clinical data
+
+## Data inspection
+
+```{r inspection, eval=TRUE}
+## Check for missing data
+summary(df_cl)  # Missing values in each column
+sapply(df_cl, function(x) sum(is.na(x)))  # Missing counts for each column
+
+## Check for unique values in categorical variables
+unique(df_cl$target)
+unique(df_cl$resistance)
+unique(df_cl$canton)
+
+## Check the first and last few dates in the dataset
+head(df_cl$date)
+tail(df_cl$date)
+```
+
+## Data description
+
+### National level
+
+Summarise data for year, target, and resistance. Then adjust data by splitting CRE and ESBL, and by combining into *Enterococcus spp.*
+
+```{r tableS7, message=FALSE, warning=FALSE, eval=TRUE}
+# Step 1: Count original entries
+summary_table <- df_cl %>%
+  group_by(year, target, resistance) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Step 2: Adjust CRE, ESBL
+summary_table_adjusted <- summary_table %>%
+  bind_rows(
+    summary_table %>% filter(resistance == "CRE, ESBL") %>% mutate(resistance = "CRE"),
+    summary_table %>% filter(resistance == "CRE, ESBL") %>% mutate(resistance = "ESBL")
+  ) %>%
+  filter(resistance != "CRE, ESBL") %>%
+  group_by(year, target, resistance) %>%
+  summarise(count = sum(count), .groups = "drop")
+
+# Step 3: Standardize target names
+summary_table_adjusted <- summary_table_adjusted %>%
+  mutate(target = case_when(
+    target %in% c("Enterococcus faecalis", "Enterococcus faecium") ~ "Enterococcus spp.",
+    target == "Escherichia coli" ~ "E. coli",
+    TRUE ~ target
+  )) %>%
+  group_by(year, target, resistance) %>%
+  summarise(count = sum(count), .groups = "drop")
+
+# Step 4: Add total per target per year
+summary_table_total <- summary_table_adjusted %>%
+  group_by(year, target) %>%
+  summarise(count = sum(count), .groups = "drop") %>%
+  mutate(resistance = "Total") %>%
+  bind_rows(summary_table_adjusted) %>%
+  filter(resistance != "susceptible")
+
+# Step 5: Summarize across years and filter relevant resistance types
+tableS7_raw <- summary_table_total %>%
+  group_by(target, resistance) %>%
+  summarise(Isolate_Count = sum(count), .groups = "drop")
+
+# Step 6: Add percentages
+tableS7_totals <- tableS7_raw %>%
+  filter(resistance == "Total") %>%
+  rename(Total_Count = Isolate_Count) %>%
+  select(target, Total_Count)
+
+tableS7 <- tableS7_raw %>%
+  left_join(tableS7_totals, by = "target") %>%
+  mutate(`Percentage of Total (%)` = ifelse(
+    resistance == "Total", "-",
+    round((Isolate_Count / Total_Count) * 100, 1)
+  )) %>%
+  arrange(target, match(resistance, c("Total", "ESBL", "CRE", "VRE")))
+
+# Step 7: Display table
+tableS7 %>%
+  select(`Bacterial Target` = target,
+         `Resistance Type` = resistance,
+         `Isolate Count` = Isolate_Count,
+         `Percentage of Total (%)` = "Percentage of Total (%)") %>%
+  kable(
+    format = "html",
+    caption = "Table S7: Total number of clinical isolates reported to ANRESIS by bacterial target and resistance profile (2021–2024). The resistance phenotypes ESBL and CR for <i>E. coli</i>, and VRE for <i>Enterococcus faecium/fecalis</i> are shown, alongside total isolate counts and their corresponding percentages.",
+    booktabs = TRUE
+  ) %>%
+  kable_styling(
+    full_width = FALSE,
+    font_size = 12,
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+
+# Optionally save
+#write.csv(tableS7, "./tables/tableS7.csv", row.names = FALSE)
+```
+
+### Cantonal level
+
+Summarize data
+
+```{r summarize_clinical_cantonal, message=FALSE, warning=FALSE, eval=TRUE}
+# Load and process clinical data by canton
+df_cantonal <- df_cl %>%
+  # Replace Enterococcus species with a unified label
+  mutate(target = ifelse(grepl("enterococcus", target, ignore.case = TRUE), "Enterococcus spp.", target)) %>%
+  # Split multiple resistance entries into individual rows
+  mutate(resistance_split = strsplit(as.character(resistance), ",\\s*")) %>%
+  unnest(resistance_split) %>%
+  select(-resistance) %>%
+  rename(resistance = resistance_split) %>%
+  group_by(target, resistance, canton) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  # Add totals per target and canton
+  group_by(target, canton) %>%
+  bind_rows(
+    summarise(., resistance = "total", count = sum(count), .groups = "drop")
+  )
+
+# Filter for totals and prepare for plotting
+cl_cantonal <- df_cantonal %>%
+  filter(resistance == "total") %>%
+  select(-resistance) %>%
+  mutate(target = factor(target, levels = c("Escherichia coli", "Enterococcus spp.")))
+
+# Save processed data to CSV
+#write.csv(cl_cantonal, "data/cl_data_cantonal.csv", row.names = FALSE)
+```
+
+### Plot Swiss maps - Fig. 1
+
+```{r plot_clinical_map_fig1, fig.cap = "Fig. 1: Total number of clinical isolates screened for antimicrobial resistance in Switzerland by canton during the study period. The maps display the cumulative number of isolates for Escherichia coli (left) and Enterococcus faecium/fecalis (right), as reported by ANRESIS, the Swiss Centre for Antibiotic Resistance. Data for E. coli were collected between November 2021 and December 2024, whereas data for Enterococcus cover the same period as the corresponding wastewater sampling. The canton-level data were extracted from the national ANRESIS database, which compiles anonymized antimicrobial resistance results from over 30 human medical laboratories and 9 veterinary laboratories across Switzerland (source: https://www.anresis.ch/about-us/guiding-principle/, accessed 21.03.2025). Locations of the six wastewater treatment plants included in this study are indicated with hatched areas and labeled accordingly.", message=FALSE, warning=FALSE, fig.height=6, fig.width=10, eval=TRUE}
+
+# Load spatial data and cantonal-level counts
+catchments <- read_sf("data/230214_ARA_BAG/230214_ARA_BAG.shp") %>%
+  select(ara_id, geometry) %>%
+  filter(ara_id %in% c(323700, 390101, 66700, 26101, 515100, 664301))
+
+canton_boundaries <- read_sf("data/swissboundaries3d_2023-01_2056_5728.shp/swissBOUNDARIES3D_1_4_TLM_KANTONSGEBIET.shp")
+
+amr_canton <- read_csv("data/cl_data_cantonal.csv") %>%
+  mutate(
+    canton = case_when(
+      canton == "St. Gall" ~ "St. Gallen",
+      canton == "Appenzell Outer Rhodes" ~ "Appenzell Outer-Rhodes",
+      TRUE ~ canton
+    )
+  )
+
+cantons_translation <- read_csv("data/cantons_translation.csv")
+
+# Compute centroids for ARA labels
+catchments_labels <- catchments %>%
+  mutate(label = as.character(ara_id)) %>%
+  st_centroid()
+
+# Join spatial and AMR data
+amr_canton_poly <- canton_boundaries %>%
+  left_join(cantons_translation, by = join_by(NAME == original_name)) %>%
+  left_join(amr_canton, by = join_by(english_name == canton), relationship = "many-to-many")
+
+amr_canton_poly <- amr_canton_poly %>%
+  mutate(
+    target = case_when(
+      target == "Enterococcus spp." ~ "Enterococcus faecium/fecalis",
+      TRUE ~ target
+    )
+  )
+
+# Define facet labels
+facet_labels <- c(
+  "Escherichia coli" = "italic('Escherichia coli')",
+  "Enterococcus faecium/fecalis" = "italic('Enterococcus faecium/fecalis')"
+)
+
+# Define manual coordinates for ARA labels (Swiss LV95 approximate coords)
+ara_labels_df <- tibble::tibble(
+  ara_id = c("323700", "390101", "66700", "26101", "515100", "664301"),
+  name = c("ARA Werdhölzli Zurich", "ARA Chur", "ARA Sensetal-Laupen", "STEP d'Aïre Genève", "CDA Lugano", "ARA Altenrhein"),
+  x = c(2723000, 2787000, 2578000, 2548000, 2741000, 2754000),
+  y = c(1236000, 1192000, 1209000, 1115000, 1117000, 1269000)
+)
+
+# Create individual plots per species
+plot_list <- lapply(
+  c("Escherichia coli", "Enterococcus faecium/fecalis"),
+  function(species) {
+    ggplot() +
+      geom_sf(
+        data = amr_canton_poly |> filter(target == species),
+        aes(fill = count),
+        color = "grey30"
+      ) +
+      geom_sf_pattern(
+        data = catchments,
+        aes(),
+        pattern = "stripe",
+        pattern_fill = "black",
+        pattern_density = 0.1,
+        pattern_spacing = 0.005,
+        pattern_size = 0.2,
+        pattern_angle = 45,
+        fill = NA,
+        color = "black",
+        linewidth = 0.45
+      ) +
+      geom_text(
+  data = ara_labels_df,
+  aes(x = x, y = y, label = name),
+  size = 3,
+  fontface = "bold",
+  color = "black"
+)       +
+      scale_fill_distiller(
+        palette = "Reds",
+        direction = 1,
+        name = "Isolate count"
+      ) +
+      labs(title = species) +
+      theme_void(base_size = 12) +
+      theme(
+        strip.background = element_blank(),
+        plot.title = element_text(face = "italic", size = 14, hjust = 0.5),
+        legend.position = "none"
+      )
+  }
+)
+
+# Extract legend from a sample plot
+legend_plot <- ggplot(amr_canton_poly |> filter(target == "Escherichia coli"), aes(fill = count)) +
+  geom_sf(color = "grey30") +
+  scale_fill_distiller(
+    palette = "Reds",
+    direction = 1,
+    name = "Isolate count",
+    guide = guide_colorbar(barheight = unit(5, "cm"))
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 10)
+  )
+
+legend <- cowplot::get_legend(legend_plot)
+
+# Combine plots into 2x2 grid with legend as last panel
+fig_clinical_maps <- (plot_list[[1]] + plot_list[[2]]) /
+                     patchwork::wrap_elements(legend) +
+                     plot_layout(guides = "collect", heights = c(10, 1))
+
+fig_clinical_maps
+
+# Save as A4 PDF
+#ggsave("./figures/Figure1.pdf", fig_clinical_maps, width = 11.69, height = 8.27 , units = "in", device = cairo_pdf)
+```
+
+## Data aggregation
+
+Wastewater data are available at the weekly level per catchment, while clinical isolate data are recorded daily and grouped by canton. To enable consistent comparison between datasets, we aggregate the clinical data:
+
+-   Temporally: From daily to weekly counts
+
+-   Geographically: From cantonal level to a national summary (for comparison with wastewater)
+
+### Aggregate by week and canton
+
+```{r clinical-weekly, message=FALSE, warning=FALSE, eval=TRUE}
+df_weekly_canton <- df_cl %>%
+  mutate(week = floor_date(date, unit = "week", week_start = 1)) %>% 
+  group_by(week, target, resistance, canton, year) %>% # Group by relevant columns
+  summarise(count = n(), .groups = "drop") # Count the number of rows for each group
+
+# Adjust the counts to combine Enterococcus faecalis and Enterococcus faecium into Enterococcus
+df_weekly_canton2 <- df_weekly_canton %>%
+  mutate(target = ifelse(target %in% c("Enterococcus faecalis", "Enterococcus faecium"), "Enterococcus spp.", target)) %>%
+  group_by(week, target, resistance, canton, year) %>%
+  summarise(count = sum(count), .groups = "drop")
+
+# Adjust counts to combine CRE,ESBL to CRE and to ESBL
+df_weekly_canton2 <- df_weekly_canton2 %>%
+  # Duplicate "CRE,ESBL" counts and assign them separately to "CRE" and "ESBL"
+  bind_rows(
+    df_weekly_canton2 %>%
+      filter(resistance == "CRE, ESBL") %>%
+      mutate(resistance = "CRE")
+  ) %>%
+  bind_rows(
+    df_weekly_canton2 %>%
+      filter(resistance == "CRE, ESBL") %>%
+      mutate(resistance = "ESBL")
+  ) %>%
+  # Remove the original "CRE,ESBL" rows
+  filter(resistance != "CRE, ESBL") %>%
+  # Aggregate counts after adjustments
+  group_by(week, target, resistance, canton, year) %>%
+  summarise(count = sum(count), .groups = "drop")
+```
+
+### Aggregate by week and country
+
+```{r clinical-week-country, message=FALSE, warning=FALSE, eval=TRUE}
+df_weekly <- df_cl %>%
+  mutate(week = floor_date(date, unit = "week", week_start = 1)) %>% # Add a week column # CHANGED floor_date() for consistency
+  group_by(week, target, resistance, year) %>% # Group by everything except canton
+  summarise(count = sum(n()), .groups = "drop") 
+
+# Adjust the counts to combine Enterococcus faecalis and Enterococcus faecium into Enterococcus
+df_weekly <- df_weekly %>%
+  mutate(target = ifelse(target %in% c("Enterococcus faecalis", "Enterococcus faecium"), "Enterococcus spp.", target)) %>%
+  group_by(week, target, resistance, year) %>%
+  summarise(count = sum(count), .groups = "drop")
+
+# Adjust counts to combine CRE,ESBL to CRE and to ESBL
+df_weekly <- df_weekly %>%
+  # Duplicate "CRE,ESBL" counts and assign them separately to "CRE" and "ESBL"
+  bind_rows(
+    df_weekly %>%
+      filter(resistance == "CRE, ESBL") %>%
+      mutate(resistance = "CRE")
+  ) %>%
+  bind_rows(
+    df_weekly %>%
+      filter(resistance == "CRE, ESBL") %>%
+      mutate(resistance = "ESBL")
+  ) %>%
+  # Remove the original "CRE,ESBL" rows
+  filter(resistance != "CRE, ESBL") %>%
+  # Aggregate counts after adjustments
+  group_by(week, target, resistance, year) %>%
+  summarise(count = sum(count), .groups = "drop")
+```
+
+## ARB Percentages
+
+### Calculations
+
+```{r arb-percentage-clinical, warning=FALSE, message=FALSE, eval=TRUE}
+# Calculate resistance percentages for weekly - nation
+df_weekly_percentages <- df_weekly %>%
+  group_by(week, target, year) %>%
+  mutate(
+    total_count = sum(count),  # Total for that target and week
+    resistance_percentage = case_when(
+      resistance == "VRE"  ~ (count / sum(count[resistance %in% c("VRE", "susceptible")])) * 100,
+      resistance == "CRE"  ~ (count / sum(count[resistance %in% c("CRE", "susceptible")])) * 100,
+      resistance == "ESBL" ~ (count / sum(count[resistance %in% c("ESBL", "susceptible")])) * 100,
+      TRUE ~ NA_real_  # Exclude "susceptible" rows
+    )
+  ) %>%
+  filter(!is.na(resistance_percentage)) %>%  # Keep only resistance rows
+  select(week, target, resistance, year, count, resistance_percentage)
+
+# Create a new facet column that separates ESBL and CRE from Escherichia coli
+df_weekly_percentages <- df_weekly_percentages %>%
+  mutate(
+    target_facet = case_when(
+      target == "Escherichia coli" & resistance == "CRE" ~ "CR-E. coli",
+      target == "Escherichia coli" & resistance == "ESBL" ~ "ESBL-E. coli",
+      TRUE ~ target  # Keep other targets the same
+    )
+  )
+
+# Calculate resistance percentages for weekly - canton
+df_canton_percentages <- df_weekly_canton2 %>%
+  group_by(week, target, canton, year) %>%
+  mutate(
+    total_count = sum(count),  # Total for that target and week
+    resistance_percentage = case_when(
+      resistance == "VRE"  ~ (count / sum(count[resistance %in% c("VRE", "susceptible")])) * 100,
+      resistance == "CRE"  ~ (count / sum(count[resistance %in% c("CRE", "susceptible")])) * 100,
+      resistance == "ESBL" ~ (count / sum(count[resistance %in% c("ESBL", "susceptible")])) * 100,
+      TRUE ~ NA_real_  # Exclude "susceptible" rows
+    )
+  ) %>%
+  filter(!is.na(resistance_percentage)) %>%  # Keep only resistance rows
+  select(week, target, resistance, year, count, canton, resistance_percentage, total_count)
+
+# Create a new facet column that separates ESBL and CRE from Escherichia coli
+df_canton_percentages <- df_canton_percentages %>%
+  mutate(
+    target_facet = case_when(
+      target == "Escherichia coli" & resistance == "CRE" ~ "CRE Escherichia coli",
+      target == "Escherichia coli" & resistance == "ESBL" ~ "ESBL Escherichia coli",
+      TRUE ~ target  # Keep other targets the same
+    )
+  )
+
+# Compute summary statistics per resistance group for national clinical data
+table1b <- df_weekly_percentages %>%
+  group_by(target_facet) %>%
+  summarise(
+    `Mean ± SD (%)` = sprintf("%.1f ± %.1f", mean(resistance_percentage, na.rm = TRUE), sd(resistance_percentage, na.rm = TRUE)),
+    `Median (IQR) %` = {
+      med <- median(resistance_percentage, na.rm = TRUE)
+      iqr_val <- IQR(resistance_percentage, na.rm = TRUE)
+      sprintf("%.1f (%.1f)", med, iqr_val)
+    },
+    `Min (%)` = sprintf("%.1f", min(resistance_percentage, na.rm = TRUE)),
+    `Max (%)` = sprintf("%.1f", max(resistance_percentage, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(`Bacterial Target` = case_when(
+    target_facet == "CRE Escherichia coli" ~ "CR-E. coli",
+    target_facet == "ESBL Escherichia coli" ~ "ESBL-E. coli",
+    target_facet == "Enterococcus spp." ~ "VRE",
+    target_facet == "Escherichia coli" ~ "E. coli",
+    TRUE ~ target_facet
+  )) %>%
+  select(`Bacterial Target`, everything(), -target_facet)
+
+# Display as Table 1b
+table1b %>%
+  kable(
+    format = "html",
+    escape = FALSE,
+    caption = "Table 1b: Summary statistics of weekly national clinical resistance percentages for each antibiotic-resistant bacterium (ARB). Values include the mean ± standard deviation (SD), median with interquartile range (IQR), and range (minimum–maximum) across the national study period. ARBs include extended-spectrum β-lactamase-producing Escherichia coli (ESBL-E. coli), carbapenem-resistant E. coli (CR-E. coli) and vancomycin-resistant Enterococcus faecium/fecalis (VRE)",
+    booktabs = TRUE
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    full_width = FALSE,
+    font_size = 12,
+    position = "center"
+  )
+```
+
+#### Table 1 - Wastewater vs clinical
+
+```{r table1, message=FALSE, warning=FALSE, eval=TRUE}
+# Step 1: Temporarily rename columns to distinguish sources
+table1a_clean <- table1a %>%
+  rename(
+    `Mean ± SD (w)` = `Mean ± SD (%)`,
+    `Median (IQR) (w)` = `Median (IQR) %`,
+    `Min (w)` = `Min (%)`,
+    `Max (w)` = `Max (%)`
+  )
+
+table1b_clean <- table1b %>%
+  rename(
+    `Mean ± SD (c)` = `Mean ± SD (%)`,
+    `Median (IQR) (c)` = `Median (IQR) %`,
+    `Min (c)` = `Min (%)`,
+    `Max (c)` = `Max (%)`
+  )
+
+# Step 2: Merge and reorder
+table1 <- full_join(table1a_clean, table1b_clean, by = "Bacterial Target") %>%
+  mutate(`Bacterial Target` = factor(`Bacterial Target`, levels = c("ESBL-E. coli", "CR-E. coli", "VRE"))) %>%
+  arrange(`Bacterial Target`) %>%
+  # Step 3: Rename columns back to matching names
+  rename(
+    `Mean ± SD (%)` = `Mean ± SD (w)`,
+    `Median (IQR) (%)` = `Median (IQR) (w)`,
+    `Min (%)` = `Min (w)`,
+    `Max (%)` = `Max (w)`,
+    `Mean ± SD (%)1` = `Mean ± SD (c)`,
+    `Median (IQR) (%)1` = `Median (IQR) (c)`,
+    `Min (%)1` = `Min (c)`,
+    `Max (%)1` = `Max (c)`
+  )
+
+# Step 4: Display table with identical labels + grouped headers
+table1 %>%
+  kable(
+    format = "html",
+    escape = FALSE,
+    booktabs = TRUE,
+    col.names = c(
+      "Bacterial Target",
+      "Mean ± SD (%)", "Median (IQR) (%)", "Min (%)", "Max (%)",  # Wastewater
+      "Mean ± SD (%)", "Median (IQR) (%)", "Min (%)", "Max (%)"   # Clinical
+    ),
+    caption = "Table 1: Comparison of weekly resistance percentages for each antimicrobial-resistant bacterium (ARB) between wastewater and clinical data. Values represent the mean ± standard deviation (SD), median with interquartile range (IQR), and range (minimum–maximum) across the national study period. ARBs include ESBL-producing <i>E. coli</i> (ESBL-<i>E. coli</i>), carbapenem-resistant <i>E. coli</i> (CR-<i>E. coli</i>, and vancomycin-resistant <i>Enterococcus faecium/fecalis</i> (VRE)"
+  ) %>%
+  add_header_above(c(" " = 1, "Wastewater" = 4, "Clinical" = 4)) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    full_width = FALSE,
+    font_size = 12,
+    position = "center"
+  )
+
+# Create a version for CSV export with explicit column source labels
+table1_for_csv <- table1 %>%
+  rename(
+    `Mean ± SD (Wastewater) (%)` = `Mean ± SD (%)`,
+    `Median (IQR) (Wastewater) (%)` = `Median (IQR) (%)`,
+    `Min (Wastewater) (%)` = `Min (%)`,
+    `Max (Wastewater) (%)` = `Max (%)`,
+    `Mean ± SD (Clinical) (%)` = `Mean ± SD (%)1`,
+    `Median (IQR) (Clinical) (%)` = `Median (IQR) (%)1`,
+    `Min (Clinical) (%)` = `Min (%)1`,
+    `Max (Clinical) (%)` = `Max (%)1`
+  )
+
+# Save as CSV
+#write.csv(table1_for_csv, "./tables/Table1.csv", row.names = FALSE)
+```
+
+#### Figure S2
+
+Filtering the data aggregated per week and canton in order to keep only data collected in those cantons with corresponding WWTPs investigated. This would allow to generate figure S2 afterwards.
+
+```{r filter-clinical-canton-important, eval=TRUE}
+df_canton_percentages_filtered <- df_canton_percentages %>%
+  dplyr::filter(canton %in% c("Ticino", "Zurich", "Grisons", "Geneva", "Berne", "St. Gall"))
+```
+
+Formatting ww dataset to align it to the clinical df.
+
+```{r format-ww-for-clinics, eval=TRUE}
+#Change WWTPs names to Canton names
+ww_percentage_trimmed <- ww_percentages_long %>%
+  mutate(
+    ara = recode(
+      ara,
+      "Altenrhein" = "St. Gall",
+      "Chur"       = "Grisons",
+      "Geneva"     = "Geneva",
+      "Laupen"     = "Berne",
+      "Zurich"     = "Zurich",
+      "Lugano"     = "Ticino"
+    )
+  ) %>%
+  rename(canton = ara)
+
+#Keep only relevant columns
+ww_percentage_trimmed <- ww_percentage_trimmed %>%
+  select(canton, week, variable, value) %>%
+  mutate(week = as.Date(week))
+
+#Specify the source of the data to "wastewater"
+ww_percentage_trimmed <- ww_percentage_trimmed %>%
+  mutate(source = "Wastewater")
+
+#Format the name of the targets to match clinical wastewater ones
+ww_percentage_trimmed <- ww_percentage_trimmed %>%
+  mutate(variable = toupper(variable))
+```
+
+Formatting clinical dataset to align it to the wastewater df.
+
+```{r format-clinical-for-ww, eval=TRUE}
+#Keep relevant columns and rename them accordingly.
+df_canton_percentages_filtered <- df_canton_percentages_filtered %>%
+  dplyr::transmute(
+    week = as.Date(week),
+    canton,
+    value = resistance_percentage,
+    variable = resistance,
+    source = "Clinical"
+  )
+
+df_canton_percentages_filtered <- df_canton_percentages_filtered %>%
+  ungroup() %>%
+  select(-year, -target)
+
+df_canton_percentages_filtered <- df_canton_percentages_filtered %>%
+  select(canton, week, variable, value, source)
+```
+
+Merging wastewater and clinical datasets.
+
+```{r merging-ww-clinical-filtered, eval=TRUE}
+df_cli_ww_filtered <- bind_rows(ww_percentage_trimmed, df_canton_percentages_filtered)
+```
+
+Plot comparison of resistance between clinical and wastewater data.
+
+```{r r fig:figureS2, fig.cap = "Fig. S2: Variation in antimicrobial-resistant bacteria (ARB) percentages across selected Swiss cantons. Boxplots show the distribution of ARB percentages in clinical and wastewater (WW) sources, plotted on a log scale. Each panel represents a different ARB type (ESBL-E. coli, CRE-E. coli and VRE), with cantons on the x-axis and separate boxplots for each source.", fig.height=6, fig.width=10, fig.lp=NULL, warning=FALSE, message=FALSE, eval=TRUE}
+
+# 1) Set order of facets
+df_cli_ww_filtered <- df_cli_ww_filtered %>%
+  mutate(
+    variable = factor(variable,
+                      levels = c("ESBL", "CRE", "VRE")))
+
+# 2) Create custom labels with italics
+facet_labels <- as_labeller(c(
+  "ESBL" = "ESBL-italic('E. coli')",
+  "CRE"  = "CR-italic('E. coli')",
+  "VRE"  = "VRE"
+), default = label_parsed)
+
+figS2 <- ggplot(df_cli_ww_filtered, aes(x = canton, y = value, fill = source)) +
+    geom_boxplot(
+    position = position_dodge(width = 0.75),
+    outlier.shape = NA,   # hide outliers
+    alpha = 0.8
+  ) +
+  facet_wrap(~ variable, ncol = 2, scales = "free_y", labeller = facet_labels) +
+  scale_y_log10(name = "ARB Percentage (%)") +
+  scale_fill_manual(values = c("Clinical" = "red", "Wastewater" = "blue")) +
+  scale_color_manual(values = c("Clinical" = "red", "Wastewater" = "blue")) +
+  labs(title = "", x = NULL, fill = "Source") +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text = element_text(color = "black"),
+    strip.background = element_rect(fill = "white"),
+    strip.text = element_text(size = 12, face = "bold"),
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+figS2
+# Save as PDF
+#ggsave("figures/FigureS2.pdf", figS2, width = 11.69, height = 8.27, units = "in")
+```
+
+### National trend analysis
+
+Analysis of trends using the Mann-Kendall Trend Test. Assumption: no seasonality is present. tau value can range from -1 to 1.
+
+```{r sens-slope-clinics, eval=TRUE, message=FALSE, warning=FALSE}
+# Mann–Kendall test per resistance of clinical data
+mk_results_cl <- df_weekly_percentages %>%
+  arrange(resistance, week) %>%
+  group_by(resistance) %>%
+  summarise(
+    mk_test = list(mk.test(resistance_percentage)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    tau     = round(map_dbl(mk_test, ~ .x$estimates["tau"]), 2),
+    p_value = signif(map_dbl(mk_test, ~ .x$p.value), 3)
+  ) %>%
+  select(resistance, tau, p_value)
+
+#Convert week to a date and numeric to compute Sen's slope test of clinical data
+df_weekly_percentages_sens <- df_weekly_percentages %>%
+  mutate(
+    week = as.Date(week),
+    time_num = as.numeric(week)   
+  )
+
+#Compute Sen's slope test by resistance type
+sens_results_cl <- df_weekly_percentages_sens %>%
+  arrange(week) %>%      
+  group_by(resistance) %>%
+  do({
+    model <- sens.slope(.$resistance_percentage)
+    tibble(
+      sen_slope = model$estimates,
+      conf_low  = model$conf.int[1],
+      conf_high = model$conf.int[2],
+      p_value   = model$p.value
+    )
+  })
+
+#Multiply slope per year
+sens_results_cl_year <- sens_results_cl %>%
+  mutate(
+    slope_per_year     = sen_slope * 52,
+    conf_low_per_year  = conf_low * 52,
+    conf_high_per_year = conf_high * 52
+  )
+
+#Combine table MK and Sen's slope
+tableS4b_combined <- mk_results_cl %>%
+  left_join(
+    sens_results_cl_year %>%
+      select(resistance, slope_per_year, conf_low_per_year, conf_high_per_year),
+    by = "resistance"
+  ) %>%
+  mutate(
+    resistance = recode(resistance,
+                        "CRE"  = "CR-E. coli",
+                        "ESBL" = "ESBL-E. coli"),
+    slope_per_year    = round(slope_per_year, 3),
+    ci_halfwidth_year = round((conf_high_per_year - conf_low_per_year) / 2, 3),
+    sen_slope_ci      = paste0(slope_per_year, " \u00B1 ", ci_halfwidth_year)
+  ) %>%
+  select(
+    `Bacterial Target` = resistance,
+    `Tau (𝜏)`          = tau,
+    `p-value`          = p_value,
+    `Sen's slope (% points per year) ± 95% CI` = sen_slope_ci
+  )
+
+#Display combined table
+tableS4b_combined %>%
+  kable(
+    format  = "html",
+    escape  = FALSE,
+    caption = "Table S4b: Mann–Kendall trend test and Sen's slope estimates for national clinical resistance percentages by bacterial target. The tau coefficient (𝜏) reflects the strength and direction of monotonic trends over time. Sen's slope values represent the estimated annual change in percentage points with 95% confidence intervals.",
+    booktabs  = TRUE,
+    longtable = FALSE
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    full_width    = FALSE,
+    position      = "center",
+    font_size     = 12
+  )
+```
+
+```{r trends-cl, warning=FALSE, message=FALSE, eval=TRUE}
+# Merge with previously defined tableS4a_combined
+tableS4 <- tableS4a_combined %>%
+  rename("Tau (𝜏) [Wastewater]" = "Tau (𝜏)",
+         "p-value [Wastewater]" = "p-value",
+         "Sen's slope (% points per year) ± 95% CI [Wastewater]"="Sen's slope (% points per year) ± 95% CI") %>%
+  full_join(tableS4b_combined, by = "Bacterial Target")
+
+
+# Display final merged table
+tableS4 %>%
+  kable(
+    format = "html",
+    escape = FALSE,
+    caption = "Table S4: Mann-Kendall trend test results for national resistance percentages in wastewater and clinical datasets. The tau coefficient (𝜏) indicates the strength and direction of monotonic trends between November 2021 and December 2024. Sen's slope values represent the estimated annual change in percentage points with 95% confidence intervals.",
+    booktabs = TRUE
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 12
+  )
+
+# Save to CSV
+#write.csv(tableS4, "./tables/tableS4.csv", row.names = FALSE)
+```
+
+#### Decomposition for trend
+
+```{r mann-kendall-decomposed-clinical, eval=TUE, message=FALSE, warning=FALSE}
+# Function to create a combined plot with faceting for decomposition components
+plot_decomp_facet <- function(ts_decomp, title) {
+  seasonality <- ts_decomp$seasonal
+  trend <- ts_decomp$trend
+  random <- ts_decomp$random
+  observed <- ts_decomp$x
+  
+  df <- data.frame(
+    Week = seq_along(observed),
+    Component = rep(c("Observed", "Trend", "Seasonal", "Random"), each = length(observed)),
+    Value = c(as.numeric(observed), as.numeric(trend), as.numeric(seasonality), as.numeric(random))
+  )
+  
+  p <- ggplot(df, aes(x = Week, y = Value)) +
+    geom_line() +
+    facet_wrap(~ Component,
+               scales = "free_y",
+               ncol = 1,
+               strip.position = "right") +
+    ggtitle(title) +
+    theme_bw() +
+    theme(
+      strip.text.y = element_text(angle = 90, vjust = 0.5),
+      strip.background = element_rect(fill = "white"),
+      axis.text = element_text(color = "black")  # Set all axis texts to black
+    )
+  
+  return(p)
+}
+
+# Customize the names for resistance groups
+df_weekly_percentages <- df_weekly_percentages %>%
+  mutate(resistance = case_when(
+    resistance == "ESBL" ~ "ESBL-E. coli",
+    resistance == "CRE" ~ "CR-E.coli",
+    resistance == "VRE" ~ "VRE"
+  ))
+
+# Decompose time series and plot only the decomposition for each resistance group in clinical data
+resistance_order <- c("ESBL-E. coli", "CR-E.coli", "VRE")
+
+decomposition_results_clinical <- list()
+decomp_plots_clinical <- list()
+
+for (resistance_group in resistance_order) {
+  # Subset data
+  data_subset <- df_weekly_percentages %>%
+    filter(resistance == resistance_group) %>%
+    arrange(week)
+  
+  # Convert to time series object
+  ts_data <- ts(data_subset$resistance_percentage, frequency = 52)  # assuming weekly data
+  
+  # Decompose time series
+  decomposition <- decompose(ts_data)
+  decomposition_results_clinical[[resistance_group]] <- decomposition
+  
+  # Custom decomposition plot
+  decomp_plot <- plot_decomp_facet(decomposition, paste("Decomposition of", resistance_group))
+  decomp_plots_clinical[[resistance_group]] <- decomp_plot
+}
+
+# Combine separate decomposition plot for each resistance group in clinical data
+figS4 <- wrap_plots(decomp_plots_clinical, ncol = 2)  # Use ncol = 2 for two columns
+
+figS4
+
+#Optional save
+#ggsave("./figures/FigureS4.pdf", figS4, width = 11.69, height = 8.27 , units = "in")
+```
+
+### Differences between cantons
+
+#### Figure S3
+
+```{r figS3, fig.cap = "Figure S3: Correlation between canton-level population size and the total number of reported clinical isolates from *E. coli* and *Enterococcus faecium/fecalis* between 2021 and 2024. Each panel shows the linear regression (red line) and the corresponding Spearman correlation coefficient. Data are stratified by bacterial target. Source: ANRESIS and Swiss Federal Statistical Office (population data as of 10.05.2024).", message=FALSE, warning=FALSE, fig.height=6, fig.width=10, eval=TRUE}
+
+# Prepare data
+df_totals <- df_cantonal %>%
+  filter(resistance == "total") %>%
+  filter(target %in% c("Escherichia coli", "Enterococcus spp.")) %>%
+  mutate(
+    Target = case_when(
+      target == "Escherichia coli" ~ "E. coli",
+      target == "Enterococcus spp." ~ "Enterococcus faecium/fecalis"
+    )
+  )
+
+df_plot <- df_totals %>%
+  left_join(population_cantons, by = "canton") %>%
+  mutate(canton = factor(canton))
+
+# Correlation stats (Spearman only)
+cor_labels <- df_plot %>%
+  group_by(Target) %>%
+  summarise(
+    Spearman = cor(Population, count, method = "spearman"),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    label = paste0("Spearman: rho = ", sprintf("%.2f", Spearman))
+  )
+
+# Create faceted plot
+figS3 <- ggplot(df_plot, aes(x = Population, y = count)) +
+  geom_point(color = "black", size = 1.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "red", linewidth = 0.8) +
+  facet_wrap(~ Target, scales = "free", nrow = 1) +
+  geom_text(
+    data = cor_labels,
+    aes(x = -Inf, y = Inf, label = label),
+    hjust = -0.05, vjust = 1.2,
+    inherit.aes = FALSE,
+    size = 3.5
+  ) +
+  labs(
+    x = "Canton population",
+    y = "Number of clinical isolates (2021–2024)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12, face = "italic"),
+    plot.title = element_blank()
+  )
+
+figS3
+
+
+# Save as PDF
+#ggsave("figures/FigureS3.pdf", figS3, width = 11.69, height = 8.27, units = "in")
+```
+
+# Antibiotics data
+
+## Format df
+
+The dataframe is filtered to keep only entries related to the whole Switzerland, and not specific to linguistic regions.
+
+```{r format-ab-data, warning=FALSE, message=FALSE, eval=TRUE}
+
+#Filter antibiotic data to keep only entries at country level
+df_ab <- df_ab_raw %>%
+  filter(`Linguistic region` == "Switzerland")
+
+#Filter for dates of interest (11.2021 - 12.2024)
+df_ab <- df_ab %>%
+  filter(Year > 2021 | (Year == 2021 & Month >= 11))
+
+#Add total DID
+# Create the "Total" entries
+df_ab_2 <- df_ab %>%
+  group_by(Year, Month, `Linguistic region`, Ab_name, ATC_code, level1, class, level2, subclass) %>%
+  summarise(DID = sum(DID, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Data_source = "Total")
+
+# Bind the new "Total" rows back to the original data
+df_ab <- bind_rows(df_ab, df_ab_2)
+
+# Create a proper Date column
+df_ab <- df_ab %>%
+  mutate(Date = as.Date(paste(Year, Month, "01", sep = "-")))
+```
+
+### Subset df for relevant antibiotics: selection
+
+```{r relevant-ab-df-selection, warning=FALSE, message=FALSE, eval=TRUE}
+# Define the abx for each target
+cre_selection_abx <- c("Ertapenem", "Imipenem", "Meropenem")
+esbl_selection_abx <- c("Cefpodoxime", "Ceftazidime", "Ceftazidime-avibactam", "Ceftriaxone", "Cefepime")
+vre_selection_abx <- c("Vancomycin")
+
+# Add new target label
+df_abx_selection <- df_ab %>%
+  mutate(target_facet = case_when(
+    Ab_name %in% cre_selection_abx ~ "CR-E. coli",
+    Ab_name %in% esbl_selection_abx ~ "ESBL-E. coli",
+    Ab_name %in% vre_selection_abx ~ "VRE",
+    TRUE ~ "others"
+  ))
+
+#Remove level "others"
+df_abx_selection <- df_abx_selection %>%
+  filter(target_facet != "others")
+```
+
+### Subset df for relevant antibiotics: treatment
+
+```{r relevant-ab-df-treatment, warning=FALSE, message=FALSE, eval=TRUE}
+# Define the abx for each target
+cre_ttt_abx <- c()
+esbl_ttt_abx <- c("Ertapenem", "Imipenem", "Meropenem")
+vre_ttt_abx <- c("Linezolid")
+
+# Add new target label
+df_abx_ttt <- df_ab %>%
+  mutate(target_facet = case_when(
+    Ab_name %in% cre_ttt_abx ~ "CR-E. coli",
+    Ab_name %in% esbl_ttt_abx ~ "ESBL-E. coli",
+    Ab_name %in% vre_ttt_abx ~ "VRE",
+    TRUE ~ "others"
+  ))
+
+#Remove level "others"
+df_abx_ttt <- df_abx_ttt %>%
+  filter(target_facet != "others")
+```
+
+### Table S1
+
+```{r tableS1, eval=TRUE}
+# Build role-tagged cores
+sel_core <- df_abx_selection %>%
+  dplyr::select(Ab_name, class, subclass, target_facet) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(Role = "Selection")
+
+ttt_core <- df_abx_ttt %>%
+  dplyr::select(Ab_name, class, subclass, target_facet) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(Role = "Treatment")
+
+# Combine and collapse roles per antibiotic/target
+tableS1 <- dplyr::bind_rows(sel_core, ttt_core) %>%
+  dplyr::group_by(target_facet, Ab_name, subclass, class) %>%
+  dplyr::summarise(Role = paste(sort(unique(Role)), collapse = " & "), .groups = "drop") %>%
+  dplyr::mutate(
+    `Bacterial Target` = dplyr::recode(target_facet,
+      "ESBL-E. coli" = "ESBL-E. coli",
+      "CR-E. coli"   = "CR-E. coli",
+      "VRE"          = "VRE"
+    )
+  ) %>%
+  dplyr::select(`Bacterial Target`, Antibiotic = Ab_name, Subclass = subclass, Class = class, Role) %>%
+  dplyr::arrange(`Bacterial Target`, Antibiotic)
+
+# Display
+tableS1 %>%
+  kable(
+    format = "html",
+    caption = "Table S1: Antibiotics included in the analysis for their potential role in the selection and/or treatment of antimicrobial-resistant bacteria (ARB) by bacterial target. The table lists each antibiotic alongside its pharmacological subclass and class, grouped by the bacterial target of interest: ESBL-Escherichia coli, CR-E. coli, and VRE. “Selection” indicates antibiotics that can drive resistance development in the target organism, while “Treatment” refers to antibiotics commonly used in clinical management of infections caused by the target.",
+    booktabs = TRUE,
+    escape = TRUE
+  ) %>%
+  kable_styling(
+    full_width = FALSE,
+    font_size = 12,
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+
+# Optional save
+#write.csv(tableS1, "./tables/tableS1.csv", row.names = FALSE)
+```
+
+# Merged data
+
+## Wastewater and clinics
+
+Merging clinical and wastewater datasets for comparisons.
+
+```{r merge-dt, eval=TRUE}
+# Standardize clinical naming
+df_weekly_percentages <- df_weekly_percentages %>%
+  mutate(target_facet = case_when(
+    target_facet == "Enterococcus spp." ~ "VRE",
+    target_facet == "CR-E. coli" ~ "CR-E. coli",
+    target_facet == "ESBL-E. coli" ~ "ESBL-E. coli",
+    TRUE ~ target_facet
+  ))
+
+# Ensure consistent column names
+weighted_percentages_long <- weighted_percentages_long %>%
+  rename(resistance_percentage = percentage, target_facet = resistance) %>%
+  mutate(Source = "Wastewater")  # Add source identifier
+
+df_weekly_percentages <- df_weekly_percentages %>%
+  mutate(Source = "Clinical")  # Add source identifier
+
+# Merge the datasets on week and target_facet
+merged_resistance_data <- bind_rows(weighted_percentages_long, df_weekly_percentages)
+```
+
+### Data modification
+
+```{r mod-data, eval=TRUE}
+# Summarize resistance_percentage per week, target, and source
+merged_resistance_summarized <- merged_resistance_data %>%
+  group_by(week, target_facet, Source) %>%
+  summarise(resistance_percentage = mean(resistance_percentage, na.rm = TRUE), .groups = "drop")
+
+# Reshape to wide format
+merged_resistance_wide <- merged_resistance_summarized %>%
+  pivot_wider(names_from = Source, values_from = resistance_percentage, names_prefix = "Resistance_")
+
+# Convert week column to date format
+merged_resistance_wide <- merged_resistance_wide %>%
+  mutate(
+    date = as.Date(week),  # Ensure it's a proper date
+    epi_week = floor_date(date, unit = "week", week_start = 1)  # Set week start on Monday
+  )
+
+# Aggregate by epidemiological week and target
+merged_resistance_wide <- merged_resistance_wide %>%
+  group_by(epi_week, target_facet) %>%
+  summarise(
+    Resistance_Clinical = ifelse(all(is.na(Resistance_Clinical)), NA, sum(Resistance_Clinical, na.rm = TRUE)),
+    Resistance_Wastewater = ifelse(all(is.na(Resistance_Wastewater)), NA, sum(Resistance_Wastewater, na.rm = TRUE)),
+    .groups = 'drop'
+  )
+
+# Ensure epi_week is Date format
+merged_resistance_wide$epi_week <- as.Date(merged_resistance_wide$epi_week)
+```
+
+### Analysis
+
+#### Correlation - Fig S5
+
+```{r figS5, fig.cap = "Fig. S5: Correlation between antibiotic-resistant bacteria (ARB) percentages in wastewater and clinical settings for three bacterial targets across weeks (2021–2024). Each point represents one week of national-level data. Spearman correlation coefficient is indicated in each panel.", fig.height=6, fig.width=10, warning=FALSE, message=FALSE, eval=TRUE}
+
+# Compute correlations with p-values (Spearman only)
+cor_labels <- merged_resistance_wide %>%
+  group_split(target_facet) %>%
+  map_dfr(function(df) {
+    target <- unique(df$target_facet)
+    spearman <- cor.test(df$Resistance_Clinical, df$Resistance_Wastewater, method = "spearman", use = "complete.obs")
+
+    # Format p-values
+    pval_fmt <- function(p) ifelse(p < 0.001, "p < 0.001", paste0("p = ", sprintf("%.3f", p)))
+
+    tibble(
+      target_facet = target,
+      label = paste0(
+        "Spearman: rho = ", sprintf("%.2f", spearman$estimate), " (", pval_fmt(spearman$p.value), ")"
+      )
+    )
+  })
+
+# Relabel for parsed facet titles
+cor_labels$target_facet <- factor(cor_labels$target_facet,
+  levels = c("ESBL-E. coli", "CR-E. coli", "VRE"),
+  labels = c("ESBL-~italic(E.~coli)", "CR-~italic(E.~coli)", "VRE")
+)
+
+merged_resistance_wide$target_facet <- factor(merged_resistance_wide$target_facet,
+  levels = c("ESBL-E. coli", "CR-E. coli", "VRE"),
+  labels = c("ESBL-~italic(E.~coli)", "CR-~italic(E.~coli)", "VRE")
+)
+
+# Create faceted correlation plot
+figS5 <- ggplot(merged_resistance_wide, aes(x = Resistance_Clinical, y = Resistance_Wastewater)) +
+  geom_point(color = "black", size = 1) +
+  geom_smooth(method = "lm", se = FALSE, color = "red", linewidth = 0.6) +
+  facet_wrap(~ target_facet, scales = "free", labeller = label_parsed) +
+  geom_text(
+    data = cor_labels,
+    aes(x = -Inf, y = Inf, label = label),
+    hjust = -0.05, vjust = 1.2,
+    inherit.aes = FALSE,
+    size = 3
+  ) +
+  labs(
+    x = "Clinical ARB (%)",
+    y = "Wastewater ARB (%)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text = element_text(color = "black"),
+    strip.background = element_rect(fill = "white"),
+    strip.text = element_text(size = 12, face = "bold"),
+    legend.position = "none"
+  )
+
+figS5
+
+# Save to high-quality PDF and PNG
+#ggsave("figures/FigureS5.pdf", figS5, width = 11.69, height = 8.27, units = "in")
+```
+
+#### Cross-correlation
+
+```{r account-for-autocorrelation-ww-clinics, warning=FALSE, message=FALSE, eval=TRUE }
+# Define helper functions
+plot_residual_diagnostics <- function(ts_fit, targets, sources) {
+  for (t in targets) {
+    for (s in sources) {
+      plt <- ts_fit %>% 
+        filter(target_facet == t, Source == s) %>%
+        ggtime::gg_tsresiduals() +
+        labs(title = paste("Residual plots", s, "-", t))
+      print(plt)
+    }
+  }
+}
+
+ljung_box_test <- function(ts_fit, targets, sources) {
+  lb <- tibble()
+  for (t in targets) {
+    for (s in sources) {
+      ts_fit_selection <- ts_fit %>% 
+        filter(target_facet == t, Source == s)
+      ts_fit_spec <- ts_fit_selection$arima_fit[[1]]$fit$spec
+      K <- ts_fit_spec$p + ts_fit_spec$q + ts_fit_spec$P + ts_fit_spec$Q
+      lb_to_add <- augment(ts_fit_selection) %>%
+        #filter(.model == "arima_fit") %>%
+        features(.innov, ljung_box, lag = 10, dof = K)
+      lb <- bind_rows(lb, lb_to_add)
+    }
+  }
+  return(lb)
+}
+
+# Create tsibble()
+ts_ww_cl <- merged_resistance_summarized %>%
+  mutate(
+    week = tsibble::yearweek(week, week_start = 1)
+    # ,resistance_percentage = log(resistance_percentage + 1)
+  ) %>%
+  as_tsibble(key = c(Source, target_facet), index = week) %>%
+  fill_gaps()
+
+# Fit ARIMA
+lambda <- ts_ww_cl %>%
+  filter(target_facet == "ESBL-E. coli", Source == "Wastewater") %>%
+  features(resistance_percentage, guerrero) %>%
+  pull(lambda_guerrero)
+ts_fit_ww_cl_1 <- ts_ww_cl %>%
+  filter(!(target_facet == "ESBL-E. coli" & Source == "Wastewater")) %>%
+  model(
+    arima_fit = ARIMA(
+      resistance_percentage, 
+      stepwise = FALSE
+      #,order_constraint = p + q + P + Q <= 24 & (constant + d + D <= 4)
+    )
+  )
+ts_fit_ww_cl_2 <- ts_ww_cl %>%
+  filter(target_facet == "ESBL-E. coli", Source == "Wastewater") %>%
+  model(
+    arima_fit = ARIMA(
+      box_cox(resistance_percentage, lambda), 
+      stepwise = FALSE
+    )
+  )
+ts_fit_ww_cl <- bind_rows(ts_fit_ww_cl_1, ts_fit_ww_cl_2)
+ts_fit_ww_cl_summary <- ts_fit_ww_cl %>% pivot_longer(
+  !c(Source, target_facet), 
+  names_to = "Model name",
+  values_to = "Orders"
+)
+
+# Impute missing values using ARIMA models
+ts_ww_cl_fill <- ts_fit_ww_cl %>%
+  interpolate(ts_ww_cl)
+
+# Fit Exponential smoothing state space model (better fit than ARIMA models)
+lambda_fill <- ts_ww_cl_fill %>%
+  filter(target_facet == "ESBL-E. coli", Source == "Wastewater") %>%
+  features(resistance_percentage, guerrero) %>%
+  pull(lambda_guerrero)
+ts_fit_ww_cl_fill_1 <- ts_ww_cl_fill %>%
+  filter(!(target_facet == "ESBL-E. coli" & Source == "Wastewater")) %>%
+  model(ets_fit = ETS(resistance_percentage))
+ts_fit_ww_cl_fill_2 <- ts_ww_cl_fill %>%
+  filter(target_facet == "ESBL-E. coli", Source == "Wastewater") %>%
+  model(ets_fit = ETS(box_cox(resistance_percentage, lambda)))
+ts_fit_ww_cl_fill <- bind_rows(ts_fit_ww_cl_fill_1, ts_fit_ww_cl_fill_2)
+ts_fit_ww_cl_fill_summary <- ts_fit_ww_cl_fill %>% 
+  pivot_longer(
+    !c(Source, target_facet), 
+    names_to = "Model name",
+    values_to = "Orders"
+  )
+
+# Residual diagnostics
+plot_residual_diagnostics(
+  ts_fit_ww_cl_fill, 
+  unique(ts_ww_cl$target_facet), 
+  unique(ts_ww_cl$Source)
+)
+
+# Ljung-Box to check for white noise
+lb_ww_cl_fill <- ljung_box_test(
+  ts_fit_ww_cl_fill, 
+  unique(ts_ww_cl_fill$target_facet), 
+  unique(ts_ww_cl_fill$Source)
+)
+ts_fit_ww_cl_fill_summary %>% 
+  left_join(
+    lb_ww_cl_fill %>% select(Source, target_facet, lb_stat), 
+    by = c("Source", "target_facet")
+  )
+
+# Compute CCF
+ccf_ww_cl_fill <- augment(ts_fit_ww_cl_fill) %>%
+  select(Source, target_facet, week, .innov) %>%
+  pivot_wider(names_from = Source, values_from = .innov) %>%
+  group_by(target_facet) %>%
+  CCF(Clinical, Wastewater)
+```
+
+##### Table 2
+
+```{r crosscorr-table-ww-clinics, eval=TRUE, warning=FALSE, message=FALSE}
+# --- 1) Paired residuals and n per target (for Bartlett bands) ----------------
+residual_pairs <- augment(ts_fit_ww_cl_fill) %>%
+  dplyr::select(Source, target_facet, week, .innov) %>%
+  tidyr::pivot_wider(names_from = Source, values_from = .innov) %>%
+  dplyr::rename(Residual_Clinical = Clinical,
+                Residual_Wastewater = Wastewater) %>%
+  dplyr::arrange(target_facet, week)
+
+n_by_target <- residual_pairs %>%
+  dplyr::filter(!is.na(Residual_Clinical), !is.na(Residual_Wastewater)) %>%
+  dplyr::count(target_facet, name = "n")
+
+# --- 2) Coerce CCF to a tidy tibble with (target_facet, lag, ccf) -------------
+ccf_tb <- tibble::as_tibble(ccf_ww_cl_fill)
+
+lag_col  <- intersect(c("lag", ".lag", "h"), names(ccf_tb))
+ccf_col  <- intersect(c("ccf", ".ccf", "value", ".value"), names(ccf_tb))
+
+stopifnot(length(lag_col) >= 1, length(ccf_col) >= 1)
+
+ccf_df <- ccf_tb %>%
+  dplyr::transmute(
+    target_facet = .data$target_facet,
+    lag = .data[[lag_col[1]]],
+    ccf = .data[[ccf_col[1]]]
+  ) %>%
+  dplyr::arrange(target_facet, lag)
+
+# --- 3) Summarizer: peak lag, Bartlett significant range, max r, interpretation
+make_ccf_summary <- function(df_one_target, n_target) {
+  if (is.na(n_target) || n_target < 3L || nrow(df_one_target) == 0L) {
+    return(tibble::tibble(
+      `Peak Lag (weeks)` = NA_integer_,
+      `Max Correlation (r)` = NA_real_,
+      `Significant Range (weeks)` = "—",
+      `Lag Interpretation` = "Insufficient data"
+    ))
+  }
+  ci <- 1.96 / sqrt(n_target)
+
+  best_idx <- which.max(abs(df_one_target$ccf))
+  best_lag <- df_one_target$lag[best_idx]
+  best_r   <- df_one_target$ccf[best_idx]
+  best_sgn <- sign(best_r)
+
+  sig <- (abs(df_one_target$ccf) >= ci) & (sign(df_one_target$ccf) == best_sgn)
+
+  if (!any(sig)) {
+    lag_interp <- ifelse(best_lag > 0, "Wastewater leads clinical",
+                   ifelse(best_lag < 0, "Clinical leads wastewater", "No lag"))
+    return(tibble::tibble(
+      `Peak Lag (weeks)` = best_lag,
+      `Max Correlation (r)` = round(best_r, 2),
+      `Significant Range (weeks)` = "—",
+      `Lag Interpretation` = lag_interp
+    ))
+  }
+
+  idx_sig <- which(sig)
+  blocks  <- cumsum(c(1L, diff(idx_sig) != 1L))
+  which_block <- blocks[which(idx_sig == best_idx)]
+  this_block  <- idx_sig[blocks == which_block]
+
+  lag_min_sig <- min(df_one_target$lag[this_block])
+  lag_max_sig <- max(df_one_target$lag[this_block])
+
+  lag_interp <- ifelse(best_lag > 0, "Wastewater leads clinical",
+                 ifelse(best_lag < 0, "Clinical leads wastewater", "No lag"))
+
+  tibble::tibble(
+    `Peak Lag (weeks)` = best_lag,
+    `Max Correlation (r)` = round(best_r, 2),
+    `Significant Range (weeks)` = paste0(lag_min_sig, " · ", lag_max_sig),
+    `Lag Interpretation` = lag_interp
+  )
+}
+
+# --- 4) Assemble the table ----------------------------------------------------
+table2 <- ccf_df %>%
+  dplyr::group_by(target_facet) %>%
+  tidyr::nest() %>%
+  dplyr::left_join(n_by_target, by = "target_facet") %>%
+  dplyr::mutate(summary = purrr::map2(data, n, make_ccf_summary)) %>%
+  dplyr::select(-data) %>%
+  tidyr::unnest(summary) %>%
+  dplyr::mutate(
+    `Bacterial Target` = dplyr::recode(
+      target_facet,
+      "ESBL-E. coli" = "ESBL-E. coli",
+      "CR-E. coli"   = "CR-E. coli",
+      "VRE"          = "VRE"
+    )
+  ) %>%
+  dplyr::select(
+    `Bacterial Target`,
+    `Peak Lag (weeks)`,
+    `Significant Range (weeks)`,
+    `Max Correlation (r)`,
+    `Lag Interpretation`
+  )
+
+# --- 5) Display (and optional save) -------------------------------------------
+table2 %>%
+  knitr::kable(
+    format  = "html",
+    caption = "Table 2: Cross-correlation between residuals of clinical and wastewater ARB percentages (after de-autocorrelation). Bartlett’s approximation (α ≈ 0.05; |r| ≥ 1.96/√n) defines significant lag ranges. Positive lags indicate wastewater leads clinical.",
+    booktabs = TRUE,
+    digits  = 2
+  ) %>%
+  kableExtra::kable_styling(full_width = FALSE, font_size = 12)
+
+#Optionally save
+#write.csv(table2, "./tables/Table2.csv", row.names = FALSE)
+```
+
+##### Plot Fig S6
+
+```{r r figS6, fig.cap = "Fig. S6: Cross-correlation between the percentage of antibiotic-resistant bacteria (ARB) in clinical and wastewater data. Positive lags indicate that wastewater trends precede clinical resistance; negative lags indicate that clinical resistance precedes wastewater trends. Negative correlation indicates that the time series move in opposite directions; positive correlation indicates that they move in the same direction. Each panel represents a target group (2021–2024).", fig.width=10, fig.height=8, warning=FALSE, message=FALSE, eval=TRUE}
+figS6=ccf_ww_cl_fill %>%
+  ggtime::autoplot() +
+  scale_x_cf_lag(breaks = seq(-20, 20, by = 5), minor_breaks = NULL) +
+  labs(x = "Lag (weeks)", y = "CCF") +
+  theme_bw() +
+  theme(
+    axis.text = element_text(color = "black"),
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "white", color = "black")  # <-- white facet background
+  ) +
+  ggplot2::geom_col(width = 0.9)
+
+figS6
+
+#Optionally save
+#ggsave("figures/FigureS6.pdf", figS6, width = 11.69, height = 8.27, units = "in")
+```
+
+#### Plots
+
+Creation of a new df.
+
+```{r}
+# Convert epi_week to Date format
+df <- merged_resistance_wide
+df$epi_week <- as.Date(df$epi_week)
+```
+
+##### ESBL-*E. coli*
+
+```{r esbl-ecoli-clinic, warning=FALSE, message=FALSE, eval=TRUE}
+# Filter for ESBL E. coli data
+plot_esbl <- function() {
+df_esbl <- df %>% filter(target_facet == "ESBL-~italic(E.~coli)")%>%
+  filter(epi_week >= min(epi_week[!is.na(Resistance_Wastewater)]) &
+         epi_week <= max(epi_week[!is.na(Resistance_Wastewater)]))
+
+# Define color palette with transparency
+clinical_col <- rgb(1, 0, 0, alpha = 0.5)  # Red for Clinical
+wastewater_col <- rgb(0, 0, 1, alpha = 0.5)  # Blue for Wastewater
+
+# Set axis limits
+ylim_clinical <- range(df_esbl$Resistance_Clinical, na.rm = TRUE)
+ylim_wastewater <- c(0, max(df_esbl$Resistance_Wastewater, na.rm = TRUE))
+
+# Adjust margins to accommodate both axes and title
+par(mar = c(4, 4, 4, 4))
+
+# Create an empty plot with Clinical Resistance on the left axis
+plot(df_esbl$epi_week, df_esbl$Resistance_Clinical, pch = 20, col = clinical_col,
+     ylim = ylim_clinical, ylab = "Clinical Resistance (%)", xlab = "Date")
+
+# Add smoothed line and confidence interval for Clinical Resistance
+loess_clinical <- loess(Resistance_Clinical ~ as.numeric(epi_week), data = df_esbl, span = 0.5)
+pred_clinical <- predict(loess_clinical, se = TRUE)
+
+polygon(c(df_esbl$epi_week, rev(df_esbl$epi_week)), 
+        c(pred_clinical$fit + 1.96 * pred_clinical$se.fit, rev(pred_clinical$fit - 1.96 * pred_clinical$se.fit)),
+        col = rgb(1, 0, 0, alpha = 0.2), border = NA)  # Confidence interval
+
+lines(df_esbl$epi_week, pred_clinical$fit, col = "red", lwd = 2)  # Smoothed line for Clinical
+
+# Overlay Wastewater Resistance on the right axis
+par(new = TRUE)
+plot(df_esbl$epi_week, df_esbl$Resistance_Wastewater, pch = 20, col = wastewater_col, 
+     ylim = ylim_wastewater, axes = FALSE, xlab = "", ylab = "")
+
+# Fit loess model for Wastewater Resistance (on non-missing data)
+df_wastewater <- df_esbl %>% filter(!is.na(Resistance_Wastewater))
+loess_wastewater <- loess(Resistance_Wastewater ~ as.numeric(epi_week), data = df_wastewater, span = 0.5)
+pred_wastewater <- predict(loess_wastewater, se = TRUE)
+
+# Add confidence interval for Wastewater Resistance
+polygon(c(df_wastewater$epi_week, rev(df_wastewater$epi_week)), 
+        c(pred_wastewater$fit + 1.96 * pred_wastewater$se.fit, rev(pred_wastewater$fit - 1.96 * pred_wastewater$se.fit)),
+        col = rgb(0, 0, 1, alpha = 0.2), border = NA)  # Confidence interval
+
+lines(df_wastewater$epi_week, pred_wastewater$fit, col = "blue", lwd = 2)  # Smoothed line for Wastewater
+
+# Add right y-axis for Wastewater Resistance
+axis(4, at = pretty(ylim_wastewater), las = 2)  # Adding axis on the right
+mtext("Wastewater Resistance (%)", side = 4, line = 3)  # Right axis label
+
+# Add title
+mtext(expression(ESBL * "-" * italic("E. coli")), side = 3, line = 1, cex = 1.2, font = 1)
+
+# Add legend
+legend("topleft", legend = c("Clinical", "Wastewater"), 
+       col = c("red", "blue"), pch = 20, lty = 1, cex = 0.8, lwd = 2, bty = "n")
+}
+
+plot_esbl()
+```
+
+##### CR*-E. coli*
+
+```{r cr-ecoli-clinic, warning=FALSE, message=FALSE, eval=TRUE}
+# Filter for CRE E. coli data
+plot_cre <- function() {
+df_cre <- df %>% filter(target_facet == "CR-~italic(E.~coli)")%>%
+  filter(epi_week >= min(epi_week[!is.na(Resistance_Wastewater)]) &
+         epi_week <= max(epi_week[!is.na(Resistance_Wastewater)])) 
+
+# Define color palette with transparency
+clinical_col <- rgb(1, 0, 0, alpha = 0.5)  # Red for Clinical
+wastewater_col <- rgb(0, 0, 1, alpha = 0.5)  # Blue for Wastewater
+
+# Set axis limits
+ylim_clinical <- range(df_cre$Resistance_Clinical, na.rm = TRUE)
+ylim_wastewater <- c(0, max(df_cre$Resistance_Wastewater, na.rm = TRUE))
+
+# Adjust margins to accommodate both axes and title
+par(mar = c(4, 4, 4, 4))
+
+# Create an empty plot with Clinical Resistance on the left axis
+plot(df_cre$epi_week, df_cre$Resistance_Clinical, pch = 20, col = clinical_col,
+     ylim = ylim_clinical, ylab = "Clinical Resistance (%)", xlab = "Date")
+
+# Add smoothed line and confidence interval for Clinical Resistance
+loess_clinical <- loess(Resistance_Clinical ~ as.numeric(epi_week), data = df_cre, span = 0.5)
+pred_clinical <- predict(loess_clinical, se = TRUE)
+
+polygon(c(df_cre$epi_week, rev(df_cre$epi_week)), 
+        c(pred_clinical$fit + 1.96 * pred_clinical$se.fit, rev(pred_clinical$fit - 1.96 * pred_clinical$se.fit)),
+        col = rgb(1, 0, 0, alpha = 0.2), border = NA)  # Confidence interval
+
+lines(df_cre$epi_week, pred_clinical$fit, col = "red", lwd = 2)  # Smoothed line for Clinical
+
+# Overlay Wastewater Resistance on the right axis
+par(new = TRUE)
+plot(df_cre$epi_week, df_cre$Resistance_Wastewater, pch = 20, col = wastewater_col, 
+     ylim = ylim_wastewater, axes = FALSE, xlab = "", ylab = "")
+
+# Fit loess model for Wastewater Resistance (on non-missing data)
+df_wastewater <- df_cre %>% filter(!is.na(Resistance_Wastewater))
+loess_wastewater <- loess(Resistance_Wastewater ~ as.numeric(epi_week), data = df_wastewater, span = 0.5)
+pred_wastewater <- predict(loess_wastewater, se = TRUE)
+
+# Add confidence interval for Wastewater Resistance
+polygon(c(df_wastewater$epi_week, rev(df_wastewater$epi_week)), 
+        c(pred_wastewater$fit + 1.96 * pred_wastewater$se.fit, rev(pred_wastewater$fit - 1.96 * pred_wastewater$se.fit)),
+        col = rgb(0, 0, 1, alpha = 0.2), border = NA)  # Confidence interval
+
+lines(df_wastewater$epi_week, pred_wastewater$fit, col = "blue", lwd = 2)  # Smoothed line for Wastewater
+
+# Add right y-axis for Wastewater Resistance
+axis(4, at = pretty(ylim_wastewater))  # Adding axis on the right
+mtext("Wastewater Resistance (%)", side = 4, line = 3)  # Right axis label
+
+# Add title
+mtext(expression(CR * "-" * italic("E. coli")), side = 3, line = 1, cex = 1.2, font = 1)
+
+# Add legend
+legend("topleft", legend = c("Clinical", "Wastewater"), 
+       col = c("red", "blue"), pch = 20, lty = 1, cex = 0.8, lwd = 2, bty = "n")
+}
+
+plot_cre()
+```
+
+##### VRE
+
+```{r vre-clinic, warning=FALSE, message=FALSE, eval=TRUE}
+# Filter for VRE data
+plot_vre <- function() {
+df_vre <- df %>% filter(target_facet == "VRE")%>%
+  filter(epi_week >= min(epi_week[!is.na(Resistance_Wastewater)]) &
+         epi_week <= max(epi_week[!is.na(Resistance_Wastewater)]))
+
+# Define color palette with transparency
+clinical_col <- rgb(1, 0, 0, alpha = 0.5)  # Red for Clinical
+wastewater_col <- rgb(0, 0, 1, alpha = 0.5)  # Blue for Wastewater
+
+# Set axis limits
+ylim_clinical <- range(df_vre$Resistance_Clinical, na.rm = TRUE)
+ylim_wastewater <- c(0, max(df_vre$Resistance_Wastewater, na.rm = TRUE))
+
+# Adjust margins to accommodate both axes and title
+par(mar = c(4, 4, 4, 4))
+
+# Create an empty plot with Clinical Resistance on the left axis
+plot(df_vre$epi_week, df_vre$Resistance_Clinical, pch = 20, col = clinical_col,
+     ylim = ylim_clinical, ylab = "Clinical Resistance (%)", xlab = "Date")
+
+# Add smoothed line and confidence interval for Clinical Resistance
+loess_clinical <- loess(Resistance_Clinical ~ as.numeric(epi_week), data = df_vre, span = 0.5)
+pred_clinical <- predict(loess_clinical, se = TRUE)
+
+polygon(c(df_vre$epi_week, rev(df_vre$epi_week)), 
+        c(pred_clinical$fit + 1.96 * pred_clinical$se.fit, rev(pred_clinical$fit - 1.96 * pred_clinical$se.fit)),
+        col = rgb(1, 0, 0, alpha = 0.2), border = NA)  # Confidence interval
+
+lines(df_vre$epi_week, pred_clinical$fit, col = "red", lwd = 2)  # Smoothed line for Clinical
+
+# Overlay Wastewater Resistance on the right axis
+par(new = TRUE)
+plot(df_vre$epi_week, df_vre$Resistance_Wastewater, pch = 20, col = wastewater_col, 
+     ylim = ylim_wastewater, axes = FALSE, xlab = "", ylab = "")
+
+# Fit loess model for Wastewater Resistance (on non-missing data)
+df_wastewater <- df_vre %>% filter(!is.na(Resistance_Wastewater))
+loess_wastewater <- loess(Resistance_Wastewater ~ as.numeric(epi_week), data = df_wastewater, span = 0.5)
+pred_wastewater <- predict(loess_wastewater, se = TRUE)
+
+# Add confidence interval for Wastewater Resistance
+polygon(c(df_wastewater$epi_week, rev(df_wastewater$epi_week)), 
+        c(pred_wastewater$fit + 1.96 * pred_wastewater$se.fit, rev(pred_wastewater$fit - 1.96 * pred_wastewater$se.fit)),
+        col = rgb(0, 0, 1, alpha = 0.2), border = NA)  # Confidence interval
+
+lines(df_wastewater$epi_week, pred_wastewater$fit, col = "blue", lwd = 2)  # Smoothed line for Wastewater
+
+# Add right y-axis for Wastewater Resistance
+axis(4, at = pretty(ylim_wastewater))  # Adding axis on the right
+mtext("Wastewater Resistance (%)", side = 4, line = 3)  # Right axis label
+
+# Add title
+mtext("VRE", side = 3, line = 1, cex = 1.2, font = 1)
+
+# Add legend
+legend("topleft", legend = c("Clinical", "Wastewater"), 
+       col = c("red", "blue"), pch = 20, lty = 1, cex = 0.8, lwd = 2, bty = "n")
+}
+
+plot_vre()
+```
+
+##### Export Figure 2
+
+```{r export-figure2, warning=FALSE, message=FALSE, eval=TRUE}
+
+# Export all four plots to a PDF as Figure 2
+#pdf("figures/Figure2.pdf", width = 11.69, height = 8.27)  # A4 landscape
+
+par(mfrow = c(2, 2))  # 2x2 layout
+plot_esbl()
+plot_cre()
+plot_vre()
+```
+
+##### Additional Plot: All bacterial targets together
+
+```{r fig2a, , fig.cap = "Fig. 2a: Comparison of mean proportions of antibiotic-resistant bacteria (ARB) in wastewater and clinical settings across Switzerland. Each point represents the average resistance percentage for ESBL–E. coli, CR–E. coli, and VRE, with error bars showing ±1 standard deviation. Data for ESBL–E. coli cover 2021–2024, whereas data for CR–E. coli and VRE cover 2022–2024.", fig.height=6, fig.width=10, warning=FALSE, message=FALSE, eval=TRUE}
+
+#Plot the mean and SD of each target measured in wastewater agains clinical settings
+fig2a=ggplot(
+  merged_resistance_wide %>%
+    group_by(target_facet) %>%
+    summarise(
+      mean_clinical = mean(Resistance_Clinical),
+      mean_wastewater = mean(Resistance_Wastewater, na.rm = TRUE),
+      sd_clinical = sd(Resistance_Clinical),
+      sd_wastewater = sd(Resistance_Wastewater, na.rm = TRUE),
+      x_label = ifelse(
+        target_facet == "CR-~italic(E.~coli)",
+        mean_clinical + 0.15,
+        mean_clinical
+      )
+    ),
+  aes(x = mean_clinical, y = mean_wastewater, label = target_facet)
+) +
+  geom_point() +
+  geom_errorbar(
+    aes(
+      ymin = mean_wastewater - sd_wastewater,
+      ymax = mean_wastewater + sd_wastewater
+    ),
+    width = 0.2
+  ) +
+  geom_errorbarh(
+    aes(
+      xmin = mean_clinical - sd_clinical,
+      xmax = mean_clinical + sd_clinical
+    ),
+    height = 0.1
+  ) +
+  geom_text(aes(x = x_label, y = mean_wastewater + sd_wastewater + 0.1), parse = TRUE, size=8) +
+  labs(
+    x = "Clinical Resistance (%)",
+    y = "Wastewater Resistance (%)"
+  ) +
+  theme_classic() +
+  theme(
+    axis.title = element_text(size = 18, color = "black"),
+    axis.text = element_text(size = 16, color = "black")
+  )
+
+fig2a
+
+# Save to high-quality PDF and PNG
+#ggsave("figures/Figure2a.pdf", fig2a, width = 11.69, height = 8.27, units = "in")
+```
+
+## Wastewater and antibiotics
+
+### Data modification
+
+Wastewater percentages are aggregated by month to align with the time resolution of the antibiotic use data. Percentages are first calculated at the national level on a weekly basis, then averaged within each month to produce monthly values. For antibiotic use, only national totals (`Data_source = "Total"`) are kept. For each bacterial target included in the study (ESBL-*E. coli*, CR-*E. coli*, and VRE), the total monthly defined daily doses (DID) were calculated separately for antibiotics classified as “treatment” or “selection” (see Table S1). The wastewater and antibiotic datasets are then combined, with monthly antibiotic totals and monthly mean wastewater percentages aligned by target and month.
+
+```{r merge-ww-antibiotics, eval=TRUE}
+prepare_ab_ww <- function(ab_df, ww_df) {
+  ## 1. Antibiotic: monthly ---------------------------------------------------
+  ab_long <- ab_df %>% 
+    filter(Data_source == "Total") %>%                     # keep totals only
+    mutate(Source = "Antibiotic") %>% 
+    transmute(                                             # keep / rename
+      time  = Date,
+      target_facet,
+      indicator_value = DID,
+      Source                                             # keeps the 'Antibiotic' label
+    )
+  
+  ## 2. Waste‑water: weekly ----------------------------------------------------
+  ww_long <- ww_df %>% 
+    filter(target_facet %in% c("ESBL-E. coli", "CR-E. coli", "VRE")) %>% 
+    mutate(Source = "Wastewater") %>% 
+    rename(
+      indicator_value = resistance_percentage,
+      time            = week
+    )
+  
+  ## 3–8.  Merge, aggregate & compute monthly WW means -------------------------
+  bind_rows(ab_long, ww_long) %>% 
+    mutate(month = floor_date(time, unit = "month")) %>%            # month flag
+    
+    # 5. summarise Antibiotic only
+    group_by(month, target_facet, Source) %>% 
+    mutate(indicator_value = if_else(
+      Source == "Antibiotic",
+      sum(indicator_value),          # sum within month by target
+      indicator_value
+    )) %>% 
+    ungroup() %>% 
+    
+    # 7. align the “time” column
+    mutate(time = if_else(Source == "Antibiotic", month, time)) %>% 
+    
+    # 8. monthly mean of WW values
+    group_by(month, target_facet, Source) %>% 
+    mutate(indicator_value_monthly_mean = if_else(
+      Source == "Wastewater",
+      mean(indicator_value, na.rm = TRUE),  # WW: mean of weeks in that month
+      indicator_value                       # Antibiotic: keep summed DID
+    )) %>% 
+    ungroup()
+}
+
+ab_ww_selection <- prepare_ab_ww(df_abx_selection, weighted_percentages_long)
+ab_ww_treatment <- prepare_ab_ww(df_abx_ttt, weighted_percentages_long)
+```
+
+### Analysis
+
+#### Correlation - FigS7
+
+```{r figS7, fig.cap = "Fig. S7: Correlation between antibiotic consumption and wastewater percentages of antibiotic-resistant bacteria (ARB) for three bacterial targets in Switzerland, 2021–2024. Panel A shows selection antibiotics (antibiotic classes that may select for the resistance phenotype; see Table S1 for the antibiotics included for each target), and Panel B shows treatment antibiotics (antibiotic classes typically used to treat infections caused by the corresponding resistant bacteria; see Table S1). Antibiotic consumption is expressed as defined daily doses per 1,000 inhabitants per day (DID) and calculated at the national level. Wastewater ARB percentages represent the proportion of resistant colonies among all colonies plated from each sample, aggregated nationally and weighted by catchment population. Each point represents one month of data. Spearman rank correlations (ρ) with associated p-values are shown in each facet for ESBL-E. coli, CR-E. coli, and VRE.", fig.height=10, fig.width=6, warning=FALSE, message=FALSE, eval=TRUE}
+
+# ── 1. FUNCTION ────────────────────────────────────────────────────────────────
+plot_ab_ww_corr <- function(merged_ab_ww_data,
+                            subtitle = NULL,           # optional figure subtitle
+                            show_caption = TRUE) {      # turn fig caption on/off
+  
+  # ── A. build monthly, wide-format data --------------------------------------
+  df_month <- merged_ab_ww_data %>%
+    mutate(month = floor_date(time, "month")) %>%
+    group_by(month, target_facet, Source) %>%
+    summarise(value = mean(indicator_value, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = Source, values_from = value, names_prefix = "Value_") %>%
+    rename(
+      Date                  = month,
+      DID                   = Value_Antibiotic,
+      Resistance_Wastewater = Value_Wastewater
+    ) %>% 
+    filter(!is.na(DID) & !is.na(Resistance_Wastewater))
+  
+  # ── B. correlation labels (Spearman only) -----------------------------------
+  cor_labels <- df_month %>% 
+    group_split(target_facet) %>% 
+    map_dfr(function(df) {
+      s  <- cor.test(df$DID, df$Resistance_Wastewater, method = "spearman")
+      tibble(
+        target_facet = unique(df$target_facet),
+        label        = sprintf("Spearman: ρ = %.2f (p = %.3f)",
+                               s$estimate, s$p.value)
+      )
+    })
+  
+  # ── C. nicer facet labels ----------------------------------------------------
+  nice_levels <- c("ESBL-E. coli", "CR-E. coli", "VRE")
+  nice_parsed <- c("ESBL-~italic(E.~coli)",
+                   "CR-~italic(E.~coli)",
+                   "VRE")
+  
+  df_month$target_facet   <- factor(df_month$target_facet,
+                                    levels = nice_levels, labels = nice_parsed)
+  cor_labels$target_facet <- factor(cor_labels$target_facet,
+                                    levels = nice_levels, labels = nice_parsed)
+  
+  # ── D. plot ------------------------------------------------------------------
+  ggplot(df_month, aes(DID, Resistance_Wastewater)) +
+    geom_point(size = 1) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = .6, colour = "red") +
+    facet_wrap(~ target_facet, scales = "free", labeller = label_parsed) +
+    geom_text(
+      data = cor_labels,
+      aes(x = -Inf, y = Inf, label = label),
+      hjust = -0.05, vjust = 1.2, size = 3,
+      inherit.aes = FALSE
+    ) +
+    labs(
+      title    = "",
+      subtitle = subtitle,
+      x        = "Antibiotic Consumption (DID)",
+      y        = "Wastewater ARB (%)",
+      caption  = if (show_caption)
+        "Each point represents one month of national-level data (2021–2024)." else NULL
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      axis.text        = element_text(colour = "black"),
+      strip.background = element_rect(fill = "white"),
+      strip.text       = element_text(size = 12, face = "bold"),
+      legend.position  = "none"
+    )
+}
+
+# ── 2. CALL IT TWICE ───────────────────────────────────────────────────────────
+
+## Two merged data frames you prepared earlier
+FigS7a <- plot_ab_ww_corr(ab_ww_selection,  subtitle = "Antibiotics selecting for resistance",  show_caption = FALSE)
+FigS7b <- plot_ab_ww_corr(ab_ww_treatment, subtitle = "Antibiotics used for treatment", show_caption = FALSE)
+
+## Look at them separately
+FigS7a
+FigS7b
+
+# Combine vertically with panel tags "A" and "B"
+FigS7 <- (FigS7a / FigS7b) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title   = "",
+    caption = "Each point represents one month of national-level data (2021–2024).",
+    tag_levels = "A",          # adds A, B to the subplots
+    tag_prefix = "",
+    tag_suffix = ""
+  ) &
+  theme(plot.tag = element_text(face = "bold", size = 12))
+
+# Preview
+FigS7
+
+# Save 
+#ggsave("figures/FigureS7.pdf", FigS7, width = 8.27, height = 11.69, units = "in")
+```
+
+#### Cross-correlation
+
+Firstly we account for autocorrelation between wastewater resistance percentage and consumption of antibiotics that select for the corresponding resistance.
+
+```{r account-for-autocorrelation-ww-selective-antibiotics, warning=FALSE, message=FALSE, eval=TRUE }
+ts_ww_ab_selection <- ab_ww_selection %>%
+  group_by(month, target_facet, Source) %>%
+  summarise(value = mean(indicator_value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(month = tsibble::yearmonth(month)) %>%
+  as_tsibble(key = c(Source, target_facet), index = month) %>%
+  fill_gaps()
+
+# Fit ARIMA
+ts_fit_ww_ab_selection <- ts_ww_ab_selection %>%
+  model(
+    arima_fit = ARIMA(
+      value, 
+      stepwise = FALSE
+    )
+  )
+ts_fit_ww_ab_selection_summary <- ts_fit_ww_ab_selection %>% pivot_longer(
+  !c(Source, target_facet), 
+  names_to = "Model name",
+  values_to = "Orders")
+
+# Residual diagnostics
+plot_residual_diagnostics(
+  ts_fit_ww_ab_selection, 
+  unique(ts_ww_ab_selection$target_facet), 
+  unique(ts_ww_ab_selection$Source)
+)
+
+# Ljung-Box test to check for white noise
+lb_ww_ab_selection <- ljung_box_test(
+  ts_fit_ww_ab_selection, 
+  unique(ts_ww_ab_selection$target_facet),
+  unique(ts_ww_ab_selection$Source)
+)
+ts_fit_ww_ab_selection_summary %>% 
+  left_join(
+    lb_ww_ab_selection %>% select(Source, target_facet, lb_stat, lb_pvalue), 
+    by = c("Source", "target_facet")
+  )
+
+# Compute and plot CCF
+ccf_ww_ab_selection <- augment(ts_fit_ww_ab_selection) %>%
+  select(Source, target_facet, month, .innov) %>%
+  pivot_wider(names_from = Source, values_from = .innov) %>%
+  group_by(target_facet) %>%
+  CCF(Antibiotic, Wastewater)
+ccf_ww_ab_selection_plot <- ccf_ww_ab_selection %>%
+  ggtime::autoplot() +
+  labs(x = "Lag [1 Month]", y = "CCF") +
+  theme_bw()
+ccf_ww_ab_selection_plot
+```
+
+Secondly we account for autocorrelation between wastewater resistance percentage and consumption of antibiotics that are used to treat the corresponding resistance.
+
+```{r account-for-autocorrelation-ww-treatment-antibiotics, warning=FALSE, message=FALSE, eval=TRUE }
+ts_ww_ab_treatment <- ab_ww_treatment %>%
+  filter(target_facet %in% c("ESBL-E. coli", "VRE")) %>%
+  group_by(month, target_facet, Source) %>%
+  summarise(value = mean(indicator_value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(month = tsibble::yearmonth(month)) %>%
+  as_tsibble(key = c(Source, target_facet), index = month) %>%
+  fill_gaps()
+
+# Fit ARIMA
+ts_fit_ww_ab_treatment <- ts_ww_ab_treatment %>%
+  model(
+    arima_fit = ARIMA(
+      value, 
+      stepwise = FALSE
+    )
+  )
+ts_fit_ww_ab_treatment_summary <- ts_fit_ww_ab_treatment %>% pivot_longer(
+  !c(Source, target_facet), 
+  names_to = "Model name",
+  values_to = "Orders")
+
+# Residual diagnostics
+plot_residual_diagnostics(
+  ts_fit_ww_ab_treatment, 
+  unique(ts_ww_ab_treatment$target_facet), 
+  unique(ts_ww_ab_treatment$Source)
+)
+
+# Ljung-Box test to check for white noise
+lb_ww_ab_treatment <- ljung_box_test(
+  ts_fit_ww_ab_treatment, 
+  unique(ts_ww_ab_treatment$target_facet),
+  unique(ts_ww_ab_treatment$Source)
+)
+ts_fit_ww_ab_treatment_summary %>% 
+  left_join(
+    lb_ww_ab_treatment %>% select(Source, target_facet, lb_stat, lb_pvalue), 
+    by = c("Source", "target_facet")
+  )
+
+# Compute and plot CCF
+ccf_ww_ab_treatment <- augment(ts_fit_ww_ab_treatment) %>%
+  select(Source, target_facet, month, .innov) %>%
+  pivot_wider(names_from = Source, values_from = .innov) %>%
+  group_by(target_facet) %>%
+  CCF(Antibiotic, Wastewater)
+ccf_ww_ab_treatment_plot <- ccf_ww_ab_treatment %>%
+  ggtime::autoplot() +
+  labs(x = "Lag [1 Month]", y = "CCF") +
+  theme_bw()
+ccf_ww_ab_treatment_plot
+```
+
+##### Table 3
+
+```{r}
+# ────────────────────────────────────────────────────────────────────────────────
+# Table 3: Cross-correlation between antibiotic consumption and wastewater resistance
+# Using de-autocorrelated residuals (ARIMA-corrected data)
+# ────────────────────────────────────────────────────────────────────────────────
+
+# Helper function to compute summary statistics from cross-correlation results ----
+compute_ccf_summary <- function(ccf_data, xvar = "Antibiotic", yvar = "Wastewater") {
+  ccf_df <- as_tibble(ccf_data)
+
+  # Identify column names depending on source (ggtime::CCF or fabletools)
+  lag_col <- if ("lag" %in% names(ccf_df)) "lag" else ".lag"
+  ccf_col <- if ("ccf" %in% names(ccf_df)) "ccf" else ".ccf"
+  n_col   <- if ("n" %in% names(ccf_df)) "n" else NULL
+
+  ccf_df <- ccf_df %>%
+    rename(lag = all_of(lag_col), ccf = all_of(ccf_col)) %>%
+    filter(!is.na(ccf)) %>%
+    group_by(target_facet) %>%
+    group_modify(~{
+      df <- .x
+      if (nrow(df) < 3) {
+        return(tibble(
+          best_lag = NA_integer_,
+          best_corr = NA_real_,
+          lag_min_sig = NA_integer_,
+          lag_max_sig = NA_integer_,
+          lag_direction = "Insufficient data"
+        ))
+      }
+
+      # Sample size (from CCF or number of points)
+      n <- if (!is.null(n_col) && all(!is.na(df[[n_col]]))) max(df[[n_col]], na.rm = TRUE) else nrow(df)
+      ci <- 1.96 / sqrt(n)  # Bartlett 95% confidence band
+
+      # Identify maximum absolute correlation and corresponding lag
+      best_idx <- which.max(abs(df$ccf))
+      best_lag <- df$lag[best_idx]
+      best_corr <- df$ccf[best_idx]
+      best_sign <- sign(best_corr)
+
+      # Handle degenerate cases (no valid correlation)
+      if (is.na(best_sign) || all(is.na(df$ccf))) {
+        return(tibble(
+          best_lag = NA_integer_,
+          best_corr = NA_real_,
+          lag_min_sig = NA_integer_,
+          lag_max_sig = NA_integer_,
+          lag_direction = "Insufficient data"
+        ))
+      }
+
+      # Identify contiguous significant range (same sign and above Bartlett threshold)
+      sig <- abs(df$ccf) >= ci & sign(df$ccf) == best_sign & !is.na(df$ccf)
+      if (any(sig, na.rm = TRUE)) {
+        idx <- which(sig)
+        block_id <- cumsum(c(1, diff(idx) != 1))
+        this_block <- block_id[which(idx == best_idx)]
+        block_idx <- idx[block_id == this_block]
+        lag_min_sig <- min(df$lag[block_idx])
+        lag_max_sig <- max(df$lag[block_idx])
+      } else {
+        lag_min_sig <- NA_integer_
+        lag_max_sig <- NA_integer_
+      }
+
+      # Interpret direction of lag
+      lag_direction <- case_when(
+        best_lag > 0  ~ paste(yvar, "leads", xvar),
+        best_lag < 0  ~ paste(xvar, "leads", yvar),
+        best_lag == 0 ~ "Synchronous",
+        TRUE          ~ "Unclear"
+      )
+
+      tibble(
+        best_lag = round(best_lag, 0),
+        best_corr = round(best_corr, 2),
+        lag_min_sig = round(lag_min_sig, 0),
+        lag_max_sig = round(lag_max_sig, 0),
+        lag_direction = lag_direction
+      )
+    })
+}
+
+# Compute summaries for both antibiotic categories -------------------------------
+ccf_table_selection <- compute_ccf_summary(ccf_ww_ab_selection) %>%
+  mutate(`Antibiotic Category` = "Selection")
+
+ccf_table_treatment <- compute_ccf_summary(ccf_ww_ab_treatment) %>%
+  mutate(`Antibiotic Category` = "Treatment")
+
+# Combine and format final Table 3 -----------------------------------------------
+table3 <- bind_rows(ccf_table_selection, ccf_table_treatment) %>%
+  mutate(
+    `Bacterial Target` = target_facet,
+    `Peak Lag (months)` = best_lag,
+    `Significant Range (months)` = ifelse(
+      is.na(lag_min_sig), "–",
+      paste0(lag_min_sig, " • ", lag_max_sig)
+    ),
+    `Max Correlation (r)` = best_corr,
+    `Lag Interpretation` = lag_direction
+  ) %>%
+  select(
+    `Antibiotic Category`,
+    `Bacterial Target`,
+    `Peak Lag (months)`,
+    `Significant Range (months)`,
+    `Max Correlation (r)`,
+    `Lag Interpretation`
+  ) %>%
+  arrange(`Antibiotic Category`, `Bacterial Target`)
+
+# Caption and render as HTML table ----------------------------------------------
+caption_table3 <- paste0(
+  "Table 3: Cross-correlation between national antibiotic consumption and ",
+  "wastewater percentages of antibiotic-resistant bacteria (ARB) in Switzerland (2021–2024), ",
+  "after accounting for autocorrelation using ARIMA residuals. ",
+  "Selection antibiotics are those with potential to select for the corresponding resistance phenotype, ",
+  "whereas treatment antibiotics are typically used to treat infections caused by the resistant bacteria. ",
+  "The Peak Lag column shows the single lag (in months) with the highest absolute correlation ",
+  "(positive lags indicate wastewater leads; negative lags indicate antibiotic use leads). ",
+  "The Significant Range lists contiguous lags that are statistically significant ",
+  "according to Bartlett’s approximation (α ≈ 0.05; |r| ≥ 1.96/√n)."
+)
+
+table3 <- kable(
+  table3,
+  format = "html",
+  caption = caption_table3,
+  booktabs = TRUE,
+  digits = 2
+) %>%
+  kable_styling(
+    full_width = FALSE,
+    font_size = 12,
+    latex_options = c("hold_position"),
+    position = "center"
+  )
+
+# Display Table 3 in R Markdown output
+table3
+```
+
+##### Plot Fig. S8
+
+Finally, we generate the cross-correlation plot between resistance in wastewater and 1) consumption of antibiotics that select for resistance and 2) consumption of antibiotics that are used for treatment.
+
+```{r figS8, fig.cap = "Fig. S8: Cross-correlation function (CCF) between the percentage of antibiotic-resistant bacteria (ARB) in wastewater and the defined daily doses of antibiotics dispensed in the community (2021–2024). Panel A: antibiotics selecting for resistance. Panel B: antibiotics used for treatment. Positive lags indicate that changes in antibiotic dispensing precede changes in wastewater resistance; negative lags indicate the reverse. Positive correlations indicate that the two time series move in the same direction, whereas negative correlations indicate opposite trends. Bars represent CCF values; dashed lines show the Bartlett 95 % confidence interval (± 1.96 / √n).", fig.width=10, fig.height=8, warning=FALSE, message=FALSE, eval=TRUE}
+common_theme <- theme_bw() +
+  theme(
+    axis.text = element_text(color = "black"),
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "white", color = "black")
+  )
+
+# If your ccf_ww_ab_* plots come from ggtime::autoplot() and are not columns yet,
+# add geom_col(width = 0.9). If they are already columns, you can omit geom_col().
+FigS8 <- (
+  (ccf_ww_ab_selection_plot +
+     labs(subtitle = "Antibiotics selecting for resistance", x = "Lag (months)", y = "CCF") +
+     common_theme + ggplot2::geom_col(width = 0.9)) /
+  (ccf_ww_ab_treatment_plot +
+     labs(subtitle = "Antibiotics used for treatment", x = "Lag (months)", y = "CCF") +
+     common_theme + ggplot2::geom_col(width = 0.9))
+) +
+  patchwork::plot_layout(guides = "collect") +
+  patchwork::plot_annotation(
+    title = "",
+    tag_levels = "A",  # adds tags "A", "B"
+    tag_prefix = "",
+    tag_suffix = ""
+  ) &
+  theme(plot.tag = element_text(face = "bold", size = 12))
+
+FigS8
+#Optionally save
+#ggsave("figures/FigureS8.pdf", FigS8, width = 8.27, height = 11.69, units = "in")  
+```
+
+### Plots - Fig. 3
+
+```{r plotting-ww-ab, eval=TRUE}
+
+# ── 0) Choose dataset (selection OR treatment) ────────────────────────────────
+set_to_plot <- ab_ww_treatment
+# set_to_plot <- ab_ww_selection   # change to ab_ww_treatment if needed
+
+# ── 1) Build plotting DF (wide: Date, DID, Resistance_Wastewater) ────────────
+df_ab_ww_plots <- set_to_plot %>%
+  group_by(time, target_facet, Source) %>%
+  summarise(value = mean(indicator_value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Source, values_from = value, names_prefix = "Value_") %>%
+  rename(
+    Date                  = time,
+    DID                   = Value_Antibiotic,
+    Resistance_Wastewater = Value_Wastewater
+  ) %>%
+  arrange(target_facet, Date)
+
+df_2 <- df_ab_ww_plots
+
+# ── 2) Pretty titles ──────────────────────────────────────────────────────────
+title_expr <- function(tf) {
+  if (grepl("^ESBL", tf)) {
+    bquote(ESBL * "-" * italic(E.~coli))
+  } else if (grepl("^CR", tf)) {
+    bquote(CR * "-" * italic(E.~coli))
+  } else if (tf == "VRE") {
+    as.expression("VRE")
+  } else {
+    as.expression(tf)
+  }
+}
+
+# ── 3) Dual-axis plotter (keeps mfrow intact; adds yearly x-axis) ────────────
+plot_ab_vs_ww <- function(df, target_value) {
+  df_t <- df %>%
+    filter(target_facet == target_value)
+  
+  if (all(is.na(df_t$Resistance_Wastewater))) {
+    plot.new()
+    title(main = paste("No wastewater data for", target_value))
+    return(invisible())
+  }
+
+  # Restrict to WW coverage window
+  x_min <- min(df_t$Date[!is.na(df_t$Resistance_Wastewater)])
+  x_max <- max(df_t$Date[!is.na(df_t$Resistance_Wastewater)])
+  df_t  <- df_t %>% filter(Date >= x_min, Date <= x_max)
+
+  # Split series
+  df_ab <- df_t %>% filter(!is.na(DID), !is.na(Date))
+  df_ww <- df_t %>% filter(!is.na(Resistance_Wastewater), !is.na(Date))
+
+  # Colors
+  AB_col     <- rgb(0.992, 0.773, 0, alpha = 0.5) #<-- treatment colours
+  AB_fill_ci <- rgb(0.992, 0.773, 0, alpha = 0.2) #<-- treatment colours
+  AB_line    <- "#fdc500"                        #<-- treatment colours
+  #AB_col     <- rgb(0, 0.392, 0, alpha = 0.5) #<-- selective colours
+  #AB_fill_ci <- rgb(0, 0.392, 0, alpha = 0.2) #<-- selective colours
+  #AB_line    <- "darkgreen"                        #<-- selective colours
+  WW_col     <- rgb(0, 0, 1, alpha = 0.5)
+  WW_fill_ci <- rgb(0, 0, 1, alpha = 0.2)
+  WW_line    <- "blue"
+
+  # y-lims
+  ylim_ab <- if (nrow(df_ab) > 0) range(df_ab$DID, na.rm = TRUE) else c(0, 1)
+  ylim_ww <- c(0, max(df_ww$Resistance_Wastewater, na.rm = TRUE))
+
+  # Save & restore only what we change (do NOT restore mfrow)
+  old_mar <- par("mar")
+  old_tcl <- par("tcl")
+  on.exit({ par(mar = old_mar); par(tcl = old_tcl) }, add = TRUE)
+
+  # Consistent tick direction (outwards) both axes
+  par(tcl = 0.5)
+  par(mar = c(4, 4, 4, 4))
+
+  # Build yearly x-axis ticks
+  year_seq <- seq(as.Date(format(x_min, "%Y-01-01")),
+                  as.Date(format(x_max, "%Y-01-01")),
+                  by = "year")
+  year_labs <- format(year_seq, "%Y")
+
+  # Left axis: Antibiotic DID
+  plot(df_ab$Date, df_ab$DID,
+       pch = 20, col = AB_col,
+       ylim = ylim_ab,
+       ylab = "Antibiotic Use (DID)",
+       xlab = "Year",
+       xaxt = "n")
+  axis(1, at = year_seq, labels = year_labs)   # years only
+  axis(2, at = pretty(ylim_ab), las = 1)       # left y, horizontal labels
+
+  # LOESS + CI for DID
+  if (nrow(df_ab) >= 4) {
+    lo_ab <- loess(DID ~ as.numeric(Date), data = df_ab, span = 0.5)
+    pr_ab <- predict(lo_ab, se = TRUE)
+    polygon(c(df_ab$Date, rev(df_ab$Date)),
+            c(pr_ab$fit + 1.96 * pr_ab$se.fit, rev(pr_ab$fit - 1.96 * pr_ab$se.fit)),
+            col = AB_fill_ci, border = NA)
+    lines(df_ab$Date, pr_ab$fit, col = AB_line, lwd = 2)
+  }
+
+  # Right axis: Wastewater %
+  par(new = TRUE)
+  plot(df_ww$Date, df_ww$Resistance_Wastewater,
+       pch = 20, col = WW_col,
+       ylim = ylim_ww,
+       axes = FALSE, xlab = "", ylab = "")
+  if (nrow(df_ww) >= 4) {
+    lo_ww <- loess(Resistance_Wastewater ~ as.numeric(Date), data = df_ww, span = 0.5)
+    pr_ww <- predict(lo_ww, se = TRUE)
+    polygon(c(df_ww$Date, rev(df_ww$Date)),
+            c(pr_ww$fit + 1.96 * pr_ww$se.fit, rev(pr_ww$fit - 1.96 * pr_ww$se.fit)),
+            col = WW_fill_ci, border = NA)
+    lines(df_ww$Date, pr_ww$fit, col = WW_line, lwd = 2)
+  }
+  axis(4, at = pretty(ylim_ww), las = 1)       # right y, horizontal labels
+  mtext("Wastewater Resistance (%)", side = 4, line = 3)
+
+  # Title + legend
+  mtext(title_expr(unique(df_t$target_facet)), side = 3, line = 1, cex = 1.2, font = 1)
+  legend("topleft", legend = c("Antibiotic Use (Used for treatment)", "Wastewater"),
+         col = c(AB_line, WW_line), pch = 20, lty = 1, cex = 0.8, lwd = 2, bty = "n")
+}
+
+# ── 4) Draw 2×2 panel on ONE page + save PDF (optional) ───────────────────────
+# PDF one page (A4 landscape)
+pdf("figures/Figure3b.pdf", width = 11.69, height =   8.27 )  # onefile=TRUE by default
+
+par(mfrow = c(2, 2))                 # <-- stays active inside functions now
+plot_ab_vs_ww(df_2, "ESBL-E. coli")
+#plot_ab_vs_ww(df_2, "CR-E. coli") #<-- activate this row when plotting selective antibiotics and not treatment. 
+plot_ab_vs_ww(df_2, "VRE")
+
+# dev.off()
+
+```
+
+**Important:** rerun the last chunk but by plotting a different dataframe which is not the one with antibiotics that select for resistance but those that are used for treatment (both df are specified at the beginning of the chunk). Before to run, adjust the name of the final figure that will be saved at the end of the chunk, from Figure3a to Figure3b. This allows to have both of them saved in the documents. Figure3a and b are then merged together using Inkscape. Furthermore, remember to activate the second last line in the chunk when plotting selective antibiotics. Change the colour as well.
+
+## Clinics and antibiotics
+
+### Merge clinical and antibiotics data
+
+```{r}
+df_cl_monthly <- df_cl %>%
+  mutate(
+    target = ifelse(target %in% c("Enterococcus faecalis", "Enterococcus faecium"), "Enterococcus spp.", target),
+    month = floor_date(date, "month", week_start = 1),
+    resistance = strsplit(as.character(resistance), ",\\s*")
+  ) %>%
+  unnest(resistance) %>%
+  group_by(month, target, resistance) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(month, target) %>%
+  mutate(
+    resistance_percentage = case_when(
+      resistance == "VRE"  ~ (count / sum(count[resistance %in% c("VRE", "susceptible")])) * 100,
+      resistance == "CRE"  ~ (count / sum(count[resistance %in% c("CRE", "susceptible")])) * 100,
+      resistance == "ESBL" ~ (count / sum(count[resistance %in% c("ESBL", "susceptible")])) * 100,
+      TRUE ~ NA_real_  # Exclude "susceptible" rows
+    )
+  ) %>%
+  ungroup() %>%
+  filter(resistance != "susceptible") %>%
+  mutate(
+    target_facet = case_when(
+      target == "Escherichia coli" & resistance == "CRE" ~ "CR-E. coli",
+      target == "Escherichia coli" & resistance == "ESBL" ~ "ESBL-E. coli",
+      TRUE ~ resistance  # Keep other targets the same
+    )
+  ) %>%
+  select(month, target_facet, resistance_percentage)
+
+df_ab_selection <- df_abx_selection %>%
+  filter(Data_source == "Total") %>%
+  mutate(month = Date) %>%
+  group_by(month, target_facet) %>%
+  summarise(DID = sum(DID), .groups = "drop") %>%
+  select(month, target_facet, DID)
+
+df_ab_treatment <- df_abx_ttt %>%
+  filter(Data_source == "Total") %>%
+  mutate(month = Date) %>%
+  group_by(month, target_facet) %>%
+  summarise(DID = sum(DID), .groups = "drop") %>%
+  select(month, target_facet, DID)
+
+ab_cl_selection_wide <- df_cl_monthly %>%
+  inner_join(df_ab_selection, by = c("month", "target_facet"))
+ab_cl_treatment_wide <- df_cl_monthly %>%
+  inner_join(df_ab_treatment, by = c("month", "target_facet"))
+```
+
+### Correlation AB and Clinics
+
+```{r, fig.height=10, fig.width=6}
+plot_ab_cl_corr <- function(df_ab_cl, subtitle = NULL, show_caption = TRUE) {
+  cor_labels <- df_ab_cl %>% 
+    group_split(target_facet) %>% 
+    map_dfr(function(df) {
+      p  <- cor.test(df$DID, df$resistance_percentage, method = "pearson")
+      s  <- cor.test(df$DID, df$resistance_percentage, method = "spearman")
+      tibble(
+        target_facet = unique(df$target_facet),
+        label        = sprintf(
+          "Pearson: r = %.2f\nSpearman: ρ = %.2f",
+          p$estimate,  s$estimate
+        )
+      )
+    })
+  nice_levels <- c("ESBL-E. coli", "CR-E. coli", "VRE")
+  nice_parsed <- c("ESBL-~italic(E.~coli)", "CR-~italic(E.~coli)","VRE")
+  
+  df_ab_cl$target_facet   <- factor(df_ab_cl$target_facet,
+                                    levels = nice_levels, labels = nice_parsed)
+  cor_labels$target_facet <- factor(cor_labels$target_facet,
+                                    levels = nice_levels, labels = nice_parsed)
+  ggplot(df_ab_cl, aes(DID, resistance_percentage)) +
+    geom_point(size = 1) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = .6, colour = "red") +
+    facet_wrap(~ target_facet, scales = "free", labeller = label_parsed) +
+    geom_text(
+      data = cor_labels,
+      aes(x = -Inf, y = Inf, label = label),
+      hjust = -0.05, vjust = 1.2, size = 3,
+      inherit.aes = FALSE
+    ) +
+    labs(
+      title    = "",
+      subtitle = subtitle,
+      x        = "Antibiotic Consumption (DID)",
+      y        = "Clinical ARB (%)",
+      caption  = if (show_caption)
+        "Each point represents one month of national‑level data (2021–2024)." else NULL
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      axis.text        = element_text(colour = "black"),
+      strip.background = element_rect(fill = "white"),
+      strip.text       = element_text(size = 12, face = "bold"),
+      legend.position  = "none"
+    )
+}
+
+fig_ab_cl_selection <- plot_ab_cl_corr(ab_cl_selection_wide,  subtitle = "Antibiotics selecting for resistance",  show_caption = FALSE)
+fig_ab_cl_treatment <- plot_ab_cl_corr(ab_cl_treatment_wide,  subtitle = "Antibiotics used for treatment",  show_caption = FALSE)
+
+fig_ab_cl <- (fig_ab_cl_selection / fig_ab_cl_treatment) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title   = "",
+    caption = "Each point represents one month of national-level data (2021–2024).",
+    tag_levels = "A",
+    tag_prefix = "", 
+    tag_suffix = ""           
+  ) &
+  theme(plot.tag = element_text(face = "bold", size = 12))
+fig_ab_cl
+```
